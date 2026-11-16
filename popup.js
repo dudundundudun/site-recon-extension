@@ -1,4 +1,4 @@
-// popup.js — логика сбора полного слепка страницы и генерации отчета для ИИ (v1.1)
+// popup.js — логика сбора полного слепка страницы и генерации отчета для ИИ (v1.2 — с поддержкой WebSocket)
 
 let latestReport = null;
 let latestMarkdown = "";
@@ -116,7 +116,7 @@ function collectPageReconInMainWorld() {
     "showDirectoryPicker", "showOpenFilePicker", "showSaveFilePicker", "originAgentCluster",
     "onpageswap", "onpagereveal", "credentialless", "fence", "speechSynthesis", "onscrollsnapchange",
     "onscrollsnapchanging", "event", "oncommand", "onanimationcancel", "fetchLater", "viewport",
-    "ongamepadconnected", "ongamepaddisconnected", "__AI_RECON_HOOKED__", "__AI_RECON_NET_LOG__"
+    "ongamepadconnected", "ongamepaddisconnected", "__AI_RECON_HOOKED__", "__AI_RECON_NET_LOG__", "__AI_RECON_WS_LOG__"
   ]);
 
   const customWindowKeys = Object.keys(window)
@@ -185,7 +185,6 @@ function collectPageReconInMainWorld() {
   for (const el of document.querySelectorAll("img, canvas, picture source")) {
     const src = el.currentSrc || el.src || el.getAttribute("data-src") || el.getAttribute("srcset") || null;
     if (!src || seenImgSrc.has(src)) continue;
-    // Пропускаем встроенные мелкие эмодзи
     if (src.includes("/emoji/") || src.startsWith("data:image/svg")) continue;
     seenImgSrc.add(src);
 
@@ -302,6 +301,7 @@ function collectPageReconInMainWorld() {
     },
     network: {
       interceptedRequests: window.__AI_RECON_NET_LOG__ || [],
+      webSockets: window.__AI_RECON_WS_LOG__ || [],
       performanceResourceEntries: perfResources,
     },
     storage: {
@@ -324,7 +324,7 @@ function formatAsAiMarkdown(report) {
     `- **Custom Window Globals**: \`${report.techStack.customWindowGlobals.slice(0, 30).join("`, `")}\``,
     "",
     "## Контекст для ИИ",
-    "Ниже находится полный технический слепок веб-страницы (семантические узлы с `data-testid` и `aria-label`, крупные медиа-контейнеры, перехваченные запросы Fetch/XHR и GraphQL, а также ключи localStorage/cookies с замаскированными секретами). Используй эти реальные селекторы и эндпоинты для написания расширения, парсера или пользовательского скрипта без выдумывания несуществующих классов.",
+    "Ниже находится полный технический слепок веб-страницы (семантические узлы с `data-testid` и `aria-label`, крупные медиа-контейнеры, перехваченные запросы Fetch/XHR/GraphQL, соединения WebSocket с примерами фреймов, а также ключи localStorage/cookies с замаскированными секретами). Используй эти реальные селекторы и эндпоинты для написания расширения, парсера или пользовательского скрипта без выдумывания несуществующих классов.",
     "",
     "```json",
     JSON.stringify(report, null, 2),
@@ -333,7 +333,7 @@ function formatAsAiMarkdown(report) {
 }
 
 scanBtn.addEventListener("click", async () => {
-  statusEl.textContent = "⏳ Сканирую DOM, Fiber, сеть и хранилища...";
+  statusEl.textContent = "⏳ Сканирую DOM, Fiber, сеть и WebSocket...";
   scanBtn.disabled = true;
 
   try {
@@ -373,16 +373,18 @@ scanBtn.addEventListener("click", async () => {
     const netCount =
       (report.network.interceptedRequests?.length || 0) +
       (report.network.performanceResourceEntries?.length || 0);
+    const wsCount = report.network.webSockets?.length || 0;
     const imgCount = report.mediaAndAssets.contentImages?.length || 0;
 
-    statusEl.textContent = `✅ Скопировано! (Сеть: ${netCount}, Контент-медиа: ${imgCount})`;
+    statusEl.textContent = `✅ Скопировано! (HTTP: ${netCount}, WS: ${wsCount}, Медиа: ${imgCount})`;
     previewEl.style.display = "block";
     previewEl.textContent = JSON.stringify(
       {
         url: report.meta.url,
         frameworks: report.techStack.detectedFrameworks,
         landmarksFound: report.domStructure.semanticLandmarks.length,
-        interceptedRequests: report.network.interceptedRequests.length,
+        interceptedHttp: report.network.interceptedRequests.length,
+        webSockets: wsCount,
         perfEntries: report.network.performanceResourceEntries.length,
         contentImages: imgCount,
       },

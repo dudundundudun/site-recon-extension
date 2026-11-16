@@ -1,20 +1,45 @@
 // interceptor.js — внедряется в MAIN world на этапе document_start
-// Перехватывает все вызовы fetch() и XMLHttpRequest на странице и складывает их в window.__AI_RECON_NET_LOG__
+// Перехватывает вызовы fetch(), XMLHttpRequest и WebSocket на странице и складывает их в window.__AI_RECON_NET_LOG__ и window.__AI_RECON_WS_LOG__
 
 (function () {
   if (window.__AI_RECON_HOOKED__) return;
   window.__AI_RECON_HOOKED__ = true;
   window.__AI_RECON_NET_LOG__ = [];
+  window.__AI_RECON_WS_LOG__ = [];
 
   const MAX_LOG_ENTRIES = 120;
   const MAX_BODY_PREVIEW = 1500;
+  const MAX_WS_SOCKETS = 20;
+  const MAX_WS_MESSAGES_PER_SOCKET = 10;
   const SENSITIVE_HEADER_RE = /^(authorization|cookie|set-cookie|x-csrf-token|x-auth-token|api-key|x-api-key)$/i;
+  const SENSITIVE_TOKEN_RE = /(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"token"\s*:\s*"[^"]+"|"auth"\s*:\s*"[^"]+"|"password"\s*:\s*"[^"]+")/gi;
 
   function safePreview(text) {
     if (typeof text !== "string") return null;
-    return text.length > MAX_BODY_PREVIEW
-      ? text.slice(0, MAX_BODY_PREVIEW) + "... [обрезано]"
-      : text;
+    const masked = text.replace(SENSITIVE_TOKEN_RE, "[REDACTED_TOKEN]");
+    return masked.length > MAX_BODY_PREVIEW
+      ? masked.slice(0, MAX_BODY_PREVIEW) + "... [обрезано]"
+      : masked;
+  }
+
+  function formatWsPayload(data) {
+    try {
+      if (typeof data === "string") {
+        return safePreview(data);
+      }
+      if (data instanceof ArrayBuffer) {
+        return `[Binary ArrayBuffer (${data.byteLength} bytes)]`;
+      }
+      if (ArrayBuffer.isView(data)) {
+        return `[Binary View ${data.constructor.name} (${data.byteLength} bytes)]`;
+      }
+      if (data instanceof Blob) {
+        return `[Binary Blob (${data.size} bytes, type: ${data.type || "unknown"})]`;
+      }
+      return safePreview( JSON.stringify(data) );
+    } catch (_) {
+      return "[Unserializable WS Payload]";
+    }
   }
 
   function sanitizeHeaders(headersObj) {
@@ -174,4 +199,79 @@
     }
     return origSend.call(this, body);
   };
+
+  // 3. Легкий перехват WebSocket (URL, протоколы и первые N входящих/исходящих фреймов)
+  const OrigWebSocket = window.WebSocket;
+  if (OrigWebSocket) {
+    const WrappedWebSocket = function (url, protocols) {
+      const wsInstance =
+        protocols !== undefined
+          ? new OrigWebSocket(url, protocols)
+          : new OrigWebSocket(url);
+
+      try {
+        const wsRecord = {
+          url: String(url || ""),
+          protocols: protocols || null,
+          createdAt: new Date().toISOString(),
+          readyState: wsInstance.readyState,
+          sentCount: 0,
+          receivedCount: 0,
+          sampleMessages: [],
+        };
+
+        if (window.__AI_RECON_WS_LOG__.length >= MAX_WS_SOCKETS) {
+          window.__AI_RECON_WS_LOG__.shift();
+        }
+        window.__AI_RECON_WS_LOG__.push(wsRecord);
+
+        // Перехват исходящих сообщений ws.send()
+        const origWsSend = wsInstance.send;
+        wsInstance.send = function (data) {
+          try {
+            wsRecord.sentCount++;
+            wsRecord.readyState = wsInstance.readyState;
+            if (wsRecord.sampleMessages.length < MAX_WS_MESSAGES_PER_SOCKET) {
+              wsRecord.sampleMessages.push({
+                direction: "outgoing",
+                timestamp: new Date().toISOString(),
+                payloadPreview: formatWsPayload(data),
+              });
+            }
+          } catch (_) {}
+          return origWsSend.apply(this, arguments);
+        };
+
+        // Перехват входящих сообщений
+        wsInstance.addEventListener("message", (event) => {
+          try {
+            wsRecord.receivedCount++;
+            wsRecord.readyState = wsInstance.readyState;
+            if (wsRecord.sampleMessages.length < MAX_WS_MESSAGES_PER_SOCKET) {
+              wsRecord.sampleMessages.push({
+                direction: "incoming",
+                timestamp: new Date().toISOString(),
+                payloadPreview: formatWsPayload(event.data),
+              });
+            }
+          } catch (_) {}
+        });
+
+        wsInstance.addEventListener("open", () => {
+          wsRecord.readyState = wsInstance.readyState;
+        });
+
+        wsInstance.addEventListener("close", (e) => {
+          wsRecord.readyState = wsInstance.readyState;
+          wsRecord.closeCode = e.code;
+        });
+      } catch (_) {}
+
+      return wsInstance;
+    };
+
+    WrappedWebSocket.prototype = OrigWebSocket.prototype;
+    Object.assign(WrappedWebSocket, OrigWebSocket);
+    window.WebSocket = WrappedWebSocket;
+  }
 })();
