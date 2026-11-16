@@ -12,6 +12,8 @@
       --muted: #949ba6;
       --primary: #3b82f6;
       --primary-hover: #2563eb;
+      --danger: #ef4444;
+      --danger-hover: #dc2626;
       --success: #10b981;
     }
     * {
@@ -47,8 +49,8 @@
     }
     .big-btn {
       width: 100%;
-      padding: 16px 14px;
-      font-size: 15px;
+      padding: 15px 14px;
+      font-size: 14.5px;
       font-weight: 700;
       color: #fff;
       background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
@@ -62,11 +64,44 @@
       justify-content: center;
       gap: 8px;
     }
-    .big-btn:hover {
+    .big-btn:hover:not(:disabled) {
       background: linear-gradient(135deg, #2563eb 0%, #1e40af 100%);
     }
-    .big-btn:active {
+    .big-btn:active:not(:disabled) {
       transform: scale(0.985);
+    }
+    .big-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .rec-btn {
+      width: 100%;
+      margin-top: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+    .rec-btn:hover:not(:disabled) {
+      background: #222731;
+      border-color: var(--danger);
+    }
+    .rec-btn.recording {
+      background: rgba(239, 68, 68, 0.14);
+      border-color: var(--danger);
+      color: #fca5a5;
+    }
+    .rec-btn.recording:hover:not(:disabled) {
+      background: rgba(239, 68, 68, 0.24);
     }
     .status {
       margin-top: 10px;
@@ -124,17 +159,22 @@
   </div>
 
   <!-- ОДНА БОЛЬШАЯ КНОПКА -->
-  <button id="scanBtn" class="big-btn">
+  <button id="scanBtn" type="button" class="big-btn">
     <span>🚀 СДЕЛАТЬ ПОЛНЫЙ СЛЕПОК САЙТА</span>
+  </button>
+
+  <!-- КНОПКА ЗАПИСИ СЕССИИ -->
+  <button id="recordBtn" type="button" class="rec-btn">
+    <span>🔴 Записать флоу (переходы, клики, API)</span>
   </button>
 
   <div id="status" class="status">Нажми кнопку, чтобы собрать архитектуру страницы</div>
 
   <!-- ТРИ МАЛЕНЬКИЕ КНОПКИ ЭКСПОРТА -->
   <div class="actions">
-    <button id="copyAiBtn" class="small-btn" disabled>📋 Промпт ИИ</button>
-    <button id="copyJsonBtn" class="small-btn" disabled>{ } JSON</button>
-    <button id="downloadBtn" class="small-btn" disabled>💾 Скачать</button>
+    <button id="copyAiBtn" type="button" class="small-btn" disabled>📋 Промпт ИИ</button>
+    <button id="copyJsonBtn" type="button" class="small-btn" disabled>{ } JSON</button>
+    <button id="downloadBtn" type="button" class="small-btn" disabled>💾 Скачать</button>
   </div>
 
   <pre id="preview" class="preview-box"></pre>

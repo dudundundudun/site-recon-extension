@@ -94,6 +94,19 @@
     return clean;
   }
 
+  function emitToBridge(kind, payload) {
+    try {
+      window.postMessage(
+        {
+          __aiReconEvent: true,
+          kind,
+          ...(kind === "net" ? { entry: payload } : { ws: payload }),
+        },
+        "*"
+      );
+    } catch (_) {}
+  }
+
   function pushLog(entry) {
     if (isNoiseRequest(entry.url, entry.contentType)) {
       window.__AI_RECON_FILTERED_COUNT__++;
@@ -103,6 +116,7 @@
       window.__AI_RECON_NET_LOG__.shift();
     }
     window.__AI_RECON_NET_LOG__.push(entry);
+    emitToBridge("net", entry);
   }
 
   // 1. Перехват window.fetch
@@ -279,6 +293,7 @@
           window.__AI_RECON_WS_LOG__.shift();
         }
         window.__AI_RECON_WS_LOG__.push(wsRecord);
+        emitToBridge("ws", { url: wsRecord.url, protocols: wsRecord.protocols, createdAt: wsRecord.createdAt });
 
         // Перехват исходящих сообщений ws.send()
         const origWsSend = wsInstance.send;

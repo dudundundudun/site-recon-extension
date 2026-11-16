@@ -1,9 +1,11 @@
-// popup.js — логика сбора полного слепка страницы и генерации отчета для ИИ (v1.3 — умные селекторы, виджеты, дедупликация и фильтрация шума)
+// popup.js — логика сбора полного слепка страницы, режима записи сессии и генерации отчета для ИИ (v1.4)
 
 let latestReport = null;
 let latestMarkdown = "";
+let isRecordingActive = false;
 
 const scanBtn = document.getElementById("scanBtn");
+const recordBtn = document.getElementById("recordBtn");
 const copyAiBtn = document.getElementById("copyAiBtn");
 const copyJsonBtn = document.getElementById("copyJsonBtn");
 const downloadBtn = document.getElementById("downloadBtn");
@@ -238,7 +240,6 @@ function collectPageReconInMainWorld() {
     const patternKey = `${selector}::${text ? "hasText" : "empty"}`;
     const count = selectorPatternCounts.get(patternKey) || 0;
 
-    // Оставляем не более 2 примеров на каждый повторяющийся шаблон селектора (чтобы карточки товаров не съели весь лимит)
     if (count >= 2) continue;
     selectorPatternCounts.set(patternKey, count + 1);
 
@@ -258,7 +259,7 @@ function collectPageReconInMainWorld() {
     if (interactiveElements.length >= 65) break;
   }
 
-  // 5. Сбор медиа-элементов с фильтрацией мелких иконок/эмодзи и дедупликацией
+  // 5. Сбор медиа-элементов
   const seenImgSrc = new Set();
   const contentImages = [];
   const smallIconsOrAvatars = [];
@@ -296,7 +297,7 @@ function collectPageReconInMainWorld() {
       poster: el.getAttribute("poster") || undefined,
     }));
 
-  // 6. Сетевая активность из Performance API с отсечением пикселей и телеметрии
+  // 6. Сетевая активность из Performance API
   const PERF_NOISE_RE = /(empty\.gif|pop-stats-collector|perf-metrics-collector|\/rum\/)/i;
   const perfResources = (performance.getEntriesByType("resource") || [])
     .filter((r) => {
@@ -322,7 +323,7 @@ function collectPageReconInMainWorld() {
       transferSize: r.transferSize || 0,
     }));
 
-  // 7. Хранилища с автоматической маскировкой приватных токенов
+  // 7. Хранилища с маскировкой секретов
   const SENSITIVE_KEY_RE = /(token|jwt|auth|secret|password|passwd|session|sess|cookie|apikey|api_key|bearer)/i;
   const JWT_VALUE_RE = /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/;
 
@@ -401,6 +402,10 @@ function collectPageReconInMainWorld() {
 }
 
 function formatAsAiMarkdown(report) {
+  const modeNote = report.sessionFlow
+    ? " В отчет также включена запись пользовательского флоу (`sessionFlow`: посещенные страницы, клики/сабмиты, уникальные дедуплицированные API-эндпоинты и все встреченные виджеты)."
+    : "";
+
   return [
     `# AI Site Recon Report: ${report.meta.title || report.meta.url}`,
     `- **URL**: ${report.meta.url}`,
@@ -409,7 +414,7 @@ function formatAsAiMarkdown(report) {
     `- **Custom Window Globals**: \`${report.techStack.customWindowGlobals.slice(0, 30).join("`, `")}\``,
     "",
     "## Контекст для ИИ",
-    "Ниже находится полный технический слепок веб-страницы (семантические узлы с `data-testid`/`data-widget` и `aria-label`, дерево виджетов, крупные медиа-контейнеры, очищенные от трекеров перехваченные запросы Fetch/XHR/GraphQL, соединения WebSocket с примерами фреймов, а также ключи localStorage/cookies с замаскированными секретами). Используй эти реальные селекторы и эндпоинты для написания расширения, парсера или пользовательского скрипта без выдумывания несуществующих классов.",
+    `Ниже находится полный технический слепок веб-страницы (семантические узлы с \`data-testid\`/\`data-widget\` и \`aria-label\`, дерево виджетов, крупные медиа-контейнеры, очищенные от трекеров перехваченные запросы Fetch/XHR/GraphQL, соединения WebSocket с примерами фреймов, а также ключи localStorage/cookies с замаскированными секретами).${modeNote} Используй эти реальные селекторы и эндпоинты для написания расширения, парсера или пользовательского скрипта без выдумывания несуществующих классов.`,
     "",
     "```json",
     JSON.stringify(report, null, 2),
@@ -426,44 +431,77 @@ async function copyTextSafely(text) {
   }
 }
 
+async function runFullPageScan(sessionFlow = null) {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !tab.id) {
+    throw new Error("Не удалось получить активную вкладку.");
+  }
+  if (!tab.url || /^(chrome|edge|about|chrome-extension):/i.test(tab.url)) {
+    throw new Error("Системные страницы браузера недоступны для сканирования.");
+  }
+
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: "MAIN",
+    func: collectPageReconInMainWorld,
+  });
+
+  const report = results?.[0]?.result;
+  if (!report) {
+    throw new Error("Не удалось собрать данные со страницы.");
+  }
+
+  try {
+    const allCookies = await chrome.cookies.getAll({ url: tab.url });
+    report.storage.allCookieMeta = allCookies.map((c) => ({
+      name: c.name,
+      domain: c.domain,
+      httpOnly: c.httpOnly,
+      secure: c.secure,
+    }));
+  } catch (_) {}
+
+  if (sessionFlow) {
+    report.sessionFlow = sessionFlow;
+  }
+
+  latestReport = report;
+  latestMarkdown = formatAsAiMarkdown(report);
+  const copied = await copyTextSafely(latestMarkdown);
+
+  copyAiBtn.disabled = false;
+  copyJsonBtn.disabled = false;
+  downloadBtn.disabled = false;
+
+  return { report, copied };
+}
+
+function updateRecordButtonUI(status) {
+  isRecordingActive = Boolean(status?.active);
+  if (isRecordingActive) {
+    recordBtn.classList.add("recording");
+    recordBtn.innerHTML = `<span>⏹ Стоп и собрать отчет (стр: ${status.pagesCount || 0}, API: ${status.endpointsCount || 0}, клики: ${status.actionsCount || 0})</span>`;
+    statusEl.textContent = "🔴 Идет запись флоу — переходи по страницам и кликай по элементам";
+  } else {
+    recordBtn.classList.remove("recording");
+    recordBtn.innerHTML = "<span>🔴 Записать флоу (переходы, клики, API)</span>";
+  }
+}
+
+// Синхронизируем состояние кнопки записи при открытии попапа
+chrome.runtime.sendMessage({ type: "RECON_GET_STATUS" }, (res) => {
+  if (chrome.runtime.lastError) return;
+  if (res && res.active) {
+    updateRecordButtonUI(res);
+  }
+});
+
 scanBtn.addEventListener("click", async () => {
   statusEl.textContent = "⏳ Сканирую DOM, виджеты, сеть и WebSocket...";
   scanBtn.disabled = true;
 
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab || !tab.id) {
-      throw new Error("Не удалось получить активную вкладку.");
-    }
-    if (!tab.url || /^(chrome|edge|about|chrome-extension):/i.test(tab.url)) {
-      throw new Error("Системные страницы браузера недоступны для сканирования.");
-    }
-
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      world: "MAIN",
-      func: collectPageReconInMainWorld,
-    });
-
-    const report = results?.[0]?.result;
-    if (!report) {
-      throw new Error("Не удалось собрать данные со страницы.");
-    }
-
-    try {
-      const allCookies = await chrome.cookies.getAll({ url: tab.url });
-      report.storage.allCookieMeta = allCookies.map((c) => ({
-        name: c.name,
-        domain: c.domain,
-        httpOnly: c.httpOnly,
-        secure: c.secure,
-      }));
-    } catch (_) {}
-
-    latestReport = report;
-    latestMarkdown = formatAsAiMarkdown(report);
-
-    const copied = await copyTextSafely(latestMarkdown);
+    const { report, copied } = await runFullPageScan(null);
 
     const netCount =
       (report.network.interceptedRequests?.length || 0) +
@@ -492,14 +530,60 @@ scanBtn.addEventListener("click", async () => {
       null,
       2
     );
-
-    copyAiBtn.disabled = false;
-    copyJsonBtn.disabled = false;
-    downloadBtn.disabled = false;
   } catch (err) {
     statusEl.textContent = `❌ Ошибка: ${err.message}`;
   } finally {
     scanBtn.disabled = false;
+  }
+});
+
+recordBtn.addEventListener("click", async () => {
+  recordBtn.disabled = true;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.id || !tab.url || /^(chrome|edge|about|chrome-extension):/i.test(tab.url)) {
+      throw new Error("Открой обычный сайт перед началом записи.");
+    }
+
+    if (!isRecordingActive) {
+      const status = await chrome.runtime.sendMessage({
+        type: "RECON_START_RECORDING",
+        tabId: tab.id,
+        url: tab.url,
+      });
+      updateRecordButtonUI(status);
+    } else {
+      statusEl.textContent = "⏳ Останавливаю запись и собираю итоговый отчет...";
+      const stopRes = await chrome.runtime.sendMessage({ type: "RECON_STOP_RECORDING" });
+      updateRecordButtonUI({ active: false });
+
+      const { report, copied } = await runFullPageScan(stopRes?.session || null);
+      const pages = report.sessionFlow?.pagesVisited?.length || 0;
+      const eps = report.sessionFlow?.uniqueEndpoints?.length || 0;
+      const acts = report.sessionFlow?.userActions?.length || 0;
+
+      statusEl.textContent = copied
+        ? `✅ Флоу скопирован! (Страниц: ${pages}, API: ${eps}, Кликов: ${acts})`
+        : `✅ Флоу готов! Нажми «Промпт ИИ» или «Скачать»`;
+
+      previewEl.style.display = "block";
+      previewEl.textContent = JSON.stringify(
+        {
+          mode: "sessionFlow",
+          url: report.meta.url,
+          pagesVisited: pages,
+          uniqueEndpoints: eps,
+          userActions: acts,
+          allWidgetsSeen: report.sessionFlow?.allWidgetsSeen?.length || 0,
+        },
+        null,
+        2
+      );
+    }
+  } catch (err) {
+    statusEl.textContent = `❌ Ошибка: ${err.message}`;
+  } finally {
+    recordBtn.disabled = false;
   }
 });
 
