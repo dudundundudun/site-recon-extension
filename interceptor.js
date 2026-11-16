@@ -6,13 +6,34 @@
   window.__AI_RECON_HOOKED__ = true;
   window.__AI_RECON_NET_LOG__ = [];
   window.__AI_RECON_WS_LOG__ = [];
+  window.__AI_RECON_FILTERED_COUNT__ = 0;
 
   const MAX_LOG_ENTRIES = 120;
-  const MAX_BODY_PREVIEW = 1500;
+  const MAX_BODY_PREVIEW = 2500;
   const MAX_WS_SOCKETS = 20;
   const MAX_WS_MESSAGES_PER_SOCKET = 10;
-  const SENSITIVE_HEADER_RE = /^(authorization|cookie|set-cookie|x-csrf-token|x-auth-token|api-key|x-api-key)$/i;
-  const SENSITIVE_TOKEN_RE = /(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"token"\s*:\s*"[^"]+"|"auth"\s*:\s*"[^"]+"|"password"\s*:\s*"[^"]+")/gi;
+
+  const SENSITIVE_HEADER_RE =
+    /^(authorization|cookie|set-cookie|x-csrf-token|x-xsrf-token|x-auth-token|x-access-token|x-session-token|api-key|x-api-key|x-api-token)$/i;
+  const SENSITIVE_TOKEN_RE =
+    /(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"token"\s*:\s*"[^"]+"|"auth"\s*:\s*"[^"]+"|"password"\s*:\s*"[^"]+")/gi;
+
+  // Фильтр телеметрии, трекинг-пикселей и статики, чтобы не забивать буфер API-запросов
+  const NOISE_URL_RE =
+    /(empty\.gif|pixel\.(gif|png)|pop-stats-collector|perf-metrics-collector|\/rum\/|google-analytics\.com|googletagmanager\.com|mc\.yandex\.ru|doubleclick\.net|sentry\.io|adriver\.ru|weborama|targetads\.io|\.(png|jpe?g|webp|gif|svg|woff2?|ttf|css)(\?|$))/i;
+
+  function isNoiseRequest(url, contentType = "") {
+    if (NOISE_URL_RE.test(String(url || ""))) return true;
+    const ct = String(contentType || "").toLowerCase();
+    if (
+      ct.startsWith("image/") ||
+      ct.startsWith("font/") ||
+      ct.includes("text/css")
+    ) {
+      return true;
+    }
+    return false;
+  }
 
   function safePreview(text) {
     if (typeof text !== "string") return null;
@@ -20,6 +41,24 @@
     return masked.length > MAX_BODY_PREVIEW
       ? masked.slice(0, MAX_BODY_PREVIEW) + "... [обрезано]"
       : masked;
+  }
+
+  function formatRequestBody(body) {
+    if (body == null) return null;
+    if (typeof body === "string") return safePreview(body);
+    if (body instanceof URLSearchParams) return safePreview(body.toString());
+    if (typeof FormData !== "undefined" && body instanceof FormData) {
+      const keys = [];
+      body.forEach((_, k) => keys.push(k));
+      return `[FormData keys: ${keys.slice(0, 20).join(", ")}]`;
+    }
+    if (body instanceof Blob) {
+      return `[Blob (${body.size} bytes, type: ${body.type || "unknown"})]`;
+    }
+    if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+      return `[Binary (${body.byteLength} bytes)]`;
+    }
+    return null;
   }
 
   function formatWsPayload(data) {
@@ -36,7 +75,7 @@
       if (data instanceof Blob) {
         return `[Binary Blob (${data.size} bytes, type: ${data.type || "unknown"})]`;
       }
-      return safePreview( JSON.stringify(data) );
+      return safePreview(JSON.stringify(data));
     } catch (_) {
       return "[Unserializable WS Payload]";
     }
@@ -56,6 +95,10 @@
   }
 
   function pushLog(entry) {
+    if (isNoiseRequest(entry.url, entry.contentType)) {
+      window.__AI_RECON_FILTERED_COUNT__++;
+      return;
+    }
     if (window.__AI_RECON_NET_LOG__.length >= MAX_LOG_ENTRIES) {
       window.__AI_RECON_NET_LOG__.shift();
     }
@@ -77,6 +120,8 @@
         const init = args[1] || {};
         if (typeof resource === "string") {
           url = resource;
+        } else if (resource instanceof URL) {
+          url = resource.href;
         } else if (resource && typeof resource.url === "string") {
           url = resource.url;
           method = resource.method || method;
@@ -89,8 +134,8 @@
             reqHeaders = { ...init.headers };
           }
         }
-        if (typeof init.body === "string") {
-          reqBody = safePreview(init.body);
+        if (init.body !== undefined) {
+          reqBody = formatRequestBody(init.body);
         }
       } catch (_) {}
 
@@ -100,6 +145,11 @@
         const response = await origFetch.apply(this, args);
         const clone = response.clone();
         const contentType = clone.headers.get("content-type") || "";
+
+        if (isNoiseRequest(url, contentType)) {
+          window.__AI_RECON_FILTERED_COUNT__++;
+          return response;
+        }
 
         if (
           contentType.includes("json") ||
@@ -132,6 +182,7 @@
             contentType,
             durationMs: Date.now() - startTime,
             requestHeaders: cleanHeaders,
+            requestBody: reqBody,
           });
         }
         return response;
@@ -171,12 +222,16 @@
 
   XMLHttpRequest.prototype.send = function (body) {
     if (this.__reconMeta) {
-      if (typeof body === "string") {
-        this.__reconMeta.requestBody = safePreview(body);
+      if (body !== undefined) {
+        this.__reconMeta.requestBody = formatRequestBody(body);
       }
       this.addEventListener("loadend", () => {
         try {
           const contentType = this.getResponseHeader("content-type") || "";
+          if (isNoiseRequest(this.__reconMeta.url, contentType)) {
+            window.__AI_RECON_FILTERED_COUNT__++;
+            return;
+          }
           let respPreview = null;
           if (this.responseType === "" || this.responseType === "text") {
             respPreview = safePreview(this.responseText || "");

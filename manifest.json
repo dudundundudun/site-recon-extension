@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "One-Button Site Recon for AI",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Полная разведка сайта в один клик: DOM, сеть (Fetch/XHR), медиа, глобальные переменные и хранилища — готовый JSON/MD отчет для ИИ.",
   "permissions": [
     "activeTab",
