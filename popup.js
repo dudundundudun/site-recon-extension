@@ -1,4 +1,4 @@
-// popup.js — логика сбора полного слепка страницы, режима записи сессии и генерации отчета для ИИ (v1.4)
+// popup.js — логика сбора полного слепка страницы, режима записи сессии и генерации отчета для ИИ (v1.5)
 
 let latestReport = null;
 let latestMarkdown = "";
@@ -27,7 +27,12 @@ function collectPageReconInMainWorld() {
     return false;
   };
 
-  // 1. Умный генератор селекторов: приоритет testid, widget, id, aria-label, name/role, классы
+  const formatIdSelector = (tag, id) => {
+    if (/^[A-Za-z_-][A-Za-z0-9_-]*$/.test(id)) return `${tag}#${id}`;
+    return `${tag}[id="${id.replace(/"/g, '\\"')}"]`;
+  };
+
+  // 1. Умный генератор селекторов: приоритет testid, auto, widget/apiary/zone, id, aria-label, name, классы
   const getSelector = (el) => {
     if (!el || el.nodeType !== 1) return "";
     const tag = el.tagName.toLowerCase();
@@ -37,6 +42,7 @@ function collectPageReconInMainWorld() {
       "data-test",
       "data-qa",
       "data-cy",
+      "data-auto",
       "data-autotest-id",
       "data-e2e",
       "data-automation-id",
@@ -46,10 +52,13 @@ function collectPageReconInMainWorld() {
       if (val) return `${tag}[${attr}="${val.replace(/"/g, '\\"')}"]`;
     }
 
-    const widget = el.getAttribute("data-widget");
-    if (widget) return `${tag}[data-widget="${widget.replace(/"/g, '\\"')}"]`;
+    const widgetAttrs = ["data-widget", "data-apiary-widget-name", "data-zone-name"];
+    for (const attr of widgetAttrs) {
+      const val = el.getAttribute(attr);
+      if (val) return `${tag}[${attr}="${val.replace(/"/g, '\\"')}"]`;
+    }
 
-    if (el.id && !/^\d/.test(el.id)) return `${tag}#${el.id}`;
+    if (el.id && !/^\d/.test(el.id)) return formatIdSelector(tag, el.id);
 
     const ariaLabel = el.getAttribute("aria-label");
     if (ariaLabel && ariaLabel.length <= 60) {
@@ -72,10 +81,15 @@ function collectPageReconInMainWorld() {
     while (cur && cur !== document.body && steps < 6) {
       const w =
         cur.getAttribute("data-widget") ||
+        cur.getAttribute("data-apiary-widget-name") ||
+        cur.getAttribute("data-zone-name") ||
         cur.getAttribute("data-testid") ||
+        cur.getAttribute("data-auto") ||
         cur.getAttribute("data-component");
       if (w) return `${cur.tagName.toLowerCase()}[${w}]`;
-      if (cur.id && !/^\d/.test(cur.id)) return `#${cur.id}`;
+      if (cur.id && !/^\d/.test(cur.id)) {
+        return /^[A-Za-z_-][A-Za-z0-9_-]*$/.test(cur.id) ? `#${cur.id}` : `[id="${cur.id}"]`;
+      }
       if (["HEADER", "NAV", "MAIN", "FOOTER", "SECTION", "ARTICLE", "FORM"].includes(cur.tagName)) {
         return cur.tagName.toLowerCase();
       }
@@ -85,7 +99,7 @@ function collectPageReconInMainWorld() {
     return undefined;
   };
 
-  // 2. Детектор современных фреймворков (React 18+ Fiber, Vue 3, Next.js, Nuxt, Webpack/Vite)
+  // 2. Детектор современных фреймворков
   const frameworks = new Set();
   if (
     window.React ||
@@ -171,7 +185,7 @@ function collectPageReconInMainWorld() {
     .filter((k) => !defaultGlobals.has(k) && !k.startsWith("webkit") && !/^\d+$/.test(k))
     .slice(0, 60);
 
-  // 3. Сбор семантических зон, виджетов (data-widget/data-component) и глубокого скелета DOM
+  // 3. Сбор семантических зон, виджетов (включая data-apiary-widget-name, data-zone-name, data-auto) и скелета DOM
   const semanticLandmarks = Array.from(
     document.querySelectorAll("main, nav, header, footer, article, section, [data-testid], [role='main'], [role='feed'], [role='region']")
   )
@@ -188,12 +202,17 @@ function collectPageReconInMainWorld() {
 
   const seenWidgets = new Set();
   const widgetContainers = [];
-  for (const el of document.querySelectorAll("[data-widget], [data-component], [data-block]")) {
+  const widgetQuery =
+    "[data-widget], [data-component], [data-block], [data-apiary-widget-name], [data-zone-name], [data-auto]";
+  for (const el of document.querySelectorAll(widgetQuery)) {
     if (isExtensionNode(el)) continue;
     const name =
       el.getAttribute("data-widget") ||
+      el.getAttribute("data-apiary-widget-name") ||
+      el.getAttribute("data-zone-name") ||
       el.getAttribute("data-component") ||
-      el.getAttribute("data-block");
+      el.getAttribute("data-block") ||
+      el.getAttribute("data-auto");
     if (!name || seenWidgets.has(name)) continue;
     seenWidgets.add(name);
     widgetContainers.push({
@@ -202,7 +221,7 @@ function collectPageReconInMainWorld() {
       childCount: el.children.length,
       textPreview: (el.innerText || "").trim().replace(/\s+/g, " ").slice(0, 80) || undefined,
     });
-    if (widgetContainers.length >= 40) break;
+    if (widgetContainers.length >= 45) break;
   }
 
   const buildSkeleton = (root, depth = 0, maxDepth = 5) => {
@@ -224,7 +243,7 @@ function collectPageReconInMainWorld() {
     };
   };
 
-  // 4. Сбор интерактивных элементов с дедупликацией повторяющихся карточек и привязкой к контексту
+  // 4. Сбор интерактивных элементов с дедупликацией
   const selectorPatternCounts = new Map();
   const interactiveElements = [];
 
@@ -248,7 +267,7 @@ function collectPageReconInMainWorld() {
       tag,
       context: getNearestContext(el),
       type: el.getAttribute("type") || undefined,
-      testId: el.getAttribute("data-testid") || undefined,
+      testId: el.getAttribute("data-testid") || el.getAttribute("data-auto") || undefined,
       ariaLabel: el.getAttribute("aria-label") || el.getAttribute("title") || undefined,
       name: el.getAttribute("name") || undefined,
       placeholder: el.getAttribute("placeholder") || undefined,
@@ -297,8 +316,9 @@ function collectPageReconInMainWorld() {
       poster: el.getAttribute("poster") || undefined,
     }));
 
-  // 6. Сетевая активность из Performance API
-  const PERF_NOISE_RE = /(empty\.gif|pop-stats-collector|perf-metrics-collector|\/rum\/)/i;
+  // 6. Сетевая активность из Performance API с фильтрацией шума
+  const PERF_NOISE_RE =
+    /(empty\.gif|pop-stats-collector|perf-metrics-collector|\/rum\/|yandex\.ru\/clck\/|media-adv\.market\.yandex\.ru\/events|em\.market\.yandex\.ru\/|safeclick|static-mon\.yandex\.net)/i;
   const perfResources = (performance.getEntriesByType("resource") || [])
     .filter((r) => {
       const u = r.name.toLowerCase();
@@ -488,7 +508,6 @@ function updateRecordButtonUI(status) {
   }
 }
 
-// Синхронизируем состояние кнопки записи при открытии попапа
 chrome.runtime.sendMessage({ type: "RECON_GET_STATUS" }, (res) => {
   if (chrome.runtime.lastError) return;
   if (res && res.active) {

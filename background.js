@@ -1,4 +1,4 @@
-// background.js — Service Worker для хранения записанной сессии (переживает переходы и перезагрузки)
+// background.js — Service Worker для хранения записанной сессии (переживает переходы, перезагрузки и новые вкладки того же origin)
 
 const SESSION_KEY = "reconSessionState";
 const MAX_PAGES = 30;
@@ -42,6 +42,17 @@ async function updateBadge(active) {
   } catch (_) {}
 }
 
+function isMatchingSessionTab(session, tab) {
+  if (!session || !session.active || !tab) return false;
+  if (tab.id === session.tabId) return true;
+  if (session.origin && tab.url) {
+    try {
+      return new URL(tab.url).origin === session.origin;
+    } catch (_) {}
+  }
+  return false;
+}
+
 function getEndpointKey(method, rawUrl) {
   try {
     const u = new URL(rawUrl, "https://placeholder.local");
@@ -76,10 +87,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     if (msg.type === "RECON_GET_STATUS") {
       const session = await getSession();
-      const isTargetTab =
-        !sender.tab || !session || sender.tab.id === session.tabId;
+      const allowed = !sender.tab || isMatchingSessionTab(session, sender.tab);
       sendResponse(
-        session && session.active && isTargetTab
+        session && session.active && allowed
           ? summarizeSession(session)
           : { active: false }
       );
@@ -97,7 +107,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await saveSession(session);
       await updateBadge(true);
 
-      // Уведомляем активную вкладку о старте записи
       try {
         await chrome.tabs.sendMessage(tabId, { type: "RECON_RECORDING_STATE", active: true });
       } catch (_) {}
@@ -118,14 +127,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await saveSession(session);
       await updateBadge(false);
 
-      if (session.tabId) {
-        try {
-          await chrome.tabs.sendMessage(session.tabId, {
-            type: "RECON_RECORDING_STATE",
-            active: false,
-          });
-        } catch (_) {}
-      }
+      try {
+        const tabs = await chrome.tabs.query({});
+        for (const t of tabs) {
+          if (t.id && (t.id === session.tabId || (session.origin && t.url?.startsWith(session.origin)))) {
+            chrome.tabs.sendMessage(t.id, { type: "RECON_RECORDING_STATE", active: false }).catch(() => {});
+          }
+        }
+      } catch (_) {}
 
       sendResponse({
         session: {
@@ -145,7 +154,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     if (msg.type === "RECON_EVENT" && sender.tab) {
       const session = await getSession();
-      if (!session || !session.active || sender.tab.id !== session.tabId) {
+      if (!isMatchingSessionTab(session, sender.tab)) {
         sendResponse({ ok: false });
         return;
       }

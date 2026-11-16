@@ -20,7 +20,7 @@
 
   // Фильтр телеметрии, трекинг-пикселей и статики, чтобы не забивать буфер API-запросов
   const NOISE_URL_RE =
-    /(empty\.gif|pixel\.(gif|png)|pop-stats-collector|perf-metrics-collector|\/rum\/|google-analytics\.com|googletagmanager\.com|mc\.yandex\.ru|doubleclick\.net|sentry\.io|adriver\.ru|weborama|targetads\.io|\.(png|jpe?g|webp|gif|svg|woff2?|ttf|css)(\?|$))/i;
+    /(empty\.gif|pixel\.(gif|png)|pop-stats-collector|perf-metrics-collector|\/rum\/|yandex\.ru\/clck\/|media-adv\.market\.yandex\.ru\/events|em\.market\.yandex\.ru\/|safeclick|static-mon\.yandex\.net|\/ping(\?|$)|google-analytics\.com|googletagmanager\.com|mc\.yandex\.ru|doubleclick\.net|sentry\.io|adriver\.ru|weborama|targetads\.io|\.(png|jpe?g|webp|gif|svg|woff2?|ttf|css)(\?|$))/i;
 
   function isNoiseRequest(url, contentType = "") {
     if (NOISE_URL_RE.test(String(url || ""))) return true;

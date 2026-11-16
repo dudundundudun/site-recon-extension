@@ -7,6 +7,11 @@
   let isRecording = false;
   let lastUrl = location.href;
 
+  function formatIdSelector(tag, id) {
+    if (/^[A-Za-z_-][A-Za-z0-9_-]*$/.test(id)) return `${tag}#${id}`;
+    return `${tag}[id="${id.replace(/"/g, '\\"')}"]`;
+  }
+
   function getCompactSelector(el) {
     if (!el || el.nodeType !== 1) return "";
     const tag = el.tagName.toLowerCase();
@@ -14,14 +19,17 @@
       "data-testid",
       "data-test",
       "data-qa",
-      "data-widget",
+      "data-auto",
       "data-autotest-id",
+      "data-widget",
+      "data-apiary-widget-name",
+      "data-zone-name",
     ];
     for (const attr of testAttrs) {
       const val = el.getAttribute(attr);
       if (val) return `${tag}[${attr}="${val.replace(/"/g, '\\"')}"]`;
     }
-    if (el.id && !/^\d/.test(el.id)) return `${tag}#${el.id}`;
+    if (el.id && !/^\d/.test(el.id)) return formatIdSelector(tag, el.id);
     const aria = el.getAttribute("aria-label");
     if (aria && aria.length <= 60) {
       return `${tag}[aria-label="${aria.replace(/"/g, '\\"')}"]`;
@@ -39,10 +47,15 @@
     while (cur && cur !== document.body && steps < 6) {
       const w =
         cur.getAttribute("data-widget") ||
+        cur.getAttribute("data-apiary-widget-name") ||
+        cur.getAttribute("data-zone-name") ||
         cur.getAttribute("data-testid") ||
+        cur.getAttribute("data-auto") ||
         cur.getAttribute("data-component");
       if (w) return `${cur.tagName.toLowerCase()}[${w}]`;
-      if (cur.id && !/^\d/.test(cur.id)) return `#${cur.id}`;
+      if (cur.id && !/^\d/.test(cur.id)) {
+        return /^[A-Za-z_-][A-Za-z0-9_-]*$/.test(cur.id) ? `#${cur.id}` : `[id="${cur.id}"]`;
+      }
       cur = cur.parentElement;
       steps++;
     }
@@ -52,13 +65,18 @@
   function collectWidgetsSnapshot() {
     const set = new Set();
     try {
-      for (const el of document.querySelectorAll("[data-widget], [data-component], [data-block]")) {
+      const selector =
+        "[data-widget], [data-component], [data-block], [data-apiary-widget-name], [data-zone-name], [data-auto]";
+      for (const el of document.querySelectorAll(selector)) {
         const w =
           el.getAttribute("data-widget") ||
+          el.getAttribute("data-apiary-widget-name") ||
+          el.getAttribute("data-zone-name") ||
           el.getAttribute("data-component") ||
-          el.getAttribute("data-block");
+          el.getAttribute("data-block") ||
+          el.getAttribute("data-auto");
         if (w) set.add(w);
-        if (set.size >= 50) break;
+        if (set.size >= 60) break;
       }
     } catch (_) {}
     return Array.from(set);
@@ -82,7 +100,6 @@
     });
   }
 
-  // Проверяем статус записи при загрузке страницы
   try {
     chrome.runtime.sendMessage({ type: "RECON_GET_STATUS" }, (res) => {
       if (chrome.runtime.lastError) return;
@@ -106,7 +123,6 @@
     }
   });
 
-  // Мост от MAIN world (interceptor.js)
   window.addEventListener("message", (event) => {
     if (event.source !== window || !event.data || !event.data.__aiReconEvent) return;
     if (!isRecording) return;
@@ -117,12 +133,11 @@
     }
   });
 
-  // Запись кликов по интерактивным элементам
   document.addEventListener(
     "click",
     (e) => {
       if (!isRecording) return;
-      const target = e.target?.closest?.("button, a, input, select, [role='button'], [data-widget], [data-testid]");
+      const target = e.target?.closest?.("button, a, input, select, [role='button'], [data-widget], [data-testid], [data-auto]");
       if (!target) return;
       const text = (target.innerText || target.value || "").trim().replace(/\s+/g, " ").slice(0, 50);
       sendEvent("action", {
@@ -137,7 +152,6 @@
     true
   );
 
-  // Запись отправки форм
   document.addEventListener(
     "submit",
     (e) => {
@@ -152,7 +166,6 @@
     true
   );
 
-  // Отслеживание SPA-переходов (History API / hashchange)
   const checkNavigation = () => {
     if (!isRecording) return;
     if (location.href !== lastUrl) {
