@@ -8,12 +8,26 @@
 
   const MAX_LOG_ENTRIES = 120;
   const MAX_BODY_PREVIEW = 1500;
+  const SENSITIVE_HEADER_RE = /^(authorization|cookie|set-cookie|x-csrf-token|x-auth-token|api-key|x-api-key)$/i;
 
   function safePreview(text) {
     if (typeof text !== "string") return null;
     return text.length > MAX_BODY_PREVIEW
       ? text.slice(0, MAX_BODY_PREVIEW) + "... [обрезано]"
       : text;
+  }
+
+  function sanitizeHeaders(headersObj) {
+    const clean = {};
+    if (!headersObj || typeof headersObj !== "object") return clean;
+    for (const [k, v] of Object.entries(headersObj)) {
+      if (SENSITIVE_HEADER_RE.test(k)) {
+        clean[k] = "[REDACTED_TOKEN_OR_SECRET]";
+      } else {
+        clean[k] = v;
+      }
+    }
+    return clean;
   }
 
   function pushLog(entry) {
@@ -55,11 +69,12 @@
         }
       } catch (_) {}
 
+      const cleanHeaders = sanitizeHeaders(reqHeaders);
+
       try {
         const response = await origFetch.apply(this, args);
         const clone = response.clone();
         const contentType = clone.headers.get("content-type") || "";
-        let respPreview = null;
 
         if (
           contentType.includes("json") ||
@@ -77,7 +92,7 @@
                 status: response.status,
                 contentType,
                 durationMs: Date.now() - startTime,
-                requestHeaders: reqHeaders,
+                requestHeaders: cleanHeaders,
                 requestBody: reqBody,
                 responsePreview: safePreview(txt),
               });
@@ -91,7 +106,7 @@
             status: response.status,
             contentType,
             durationMs: Date.now() - startTime,
-            requestHeaders: reqHeaders,
+            requestHeaders: cleanHeaders,
           });
         }
         return response;
@@ -138,10 +153,7 @@
         try {
           const contentType = this.getResponseHeader("content-type") || "";
           let respPreview = null;
-          if (
-            this.responseType === "" ||
-            this.responseType === "text"
-          ) {
+          if (this.responseType === "" || this.responseType === "text") {
             respPreview = safePreview(this.responseText || "");
           } else if (this.responseType === "json" && this.response) {
             respPreview = safePreview(JSON.stringify(this.response));
@@ -153,7 +165,7 @@
             status: this.status,
             contentType,
             durationMs: Date.now() - this.__reconMeta.startTime,
-            requestHeaders: this.__reconMeta.headers,
+            requestHeaders: sanitizeHeaders(this.__reconMeta.headers),
             requestBody: this.__reconMeta.requestBody || null,
             responsePreview: respPreview,
           });

@@ -1,4 +1,4 @@
-// popup.js — логика сбора полного слепка страницы и генерации отчета для ИИ
+// popup.js — логика сбора полного слепка страницы и генерации отчета для ИИ (v1.1)
 
 let latestReport = null;
 let latestMarkdown = "";
@@ -12,27 +12,69 @@ const previewEl = document.getElementById("preview");
 
 // Функция, которая выполняется внутри страницы (в MAIN world), чтобы иметь доступ к window и перехваченным логам
 function collectPageReconInMainWorld() {
+  // 1. Умный генератор селекторов: приоритет data-testid, id, role и aria-label
   const getSelector = (el) => {
     if (!el || el.nodeType !== 1) return "";
-    if (el.id) return `#${el.id}`;
+    const tag = el.tagName.toLowerCase();
+    const testId =
+      el.getAttribute("data-testid") ||
+      el.getAttribute("data-test") ||
+      el.getAttribute("data-qa") ||
+      el.getAttribute("data-cy");
+    if (testId) return `${tag}[data-testid="${testId}"]`;
+    if (el.id && !/^\d/.test(el.id)) return `${tag}#${el.id}`;
+
+    const ariaLabel = el.getAttribute("aria-label");
+    if (ariaLabel && ariaLabel.length <= 36) {
+      return `${tag}[aria-label="${ariaLabel.replace(/"/g, '\\"')}"]`;
+    }
+
     const classes = Array.from(el.classList || [])
       .filter((c) => c && !c.includes(":"))
       .slice(0, 3)
       .join(".");
-    return `${el.tagName.toLowerCase()}${classes ? "." + classes : ""}`;
+    return `${tag}${classes ? "." + classes : ""}`;
   };
 
-  // 1. Определение фреймворков и глобальных объектов
-  const frameworks = [];
-  if (window.React || document.querySelector("[data-reactroot], [data-reactid]")) frameworks.push("React");
-  if (window.__NEXT_DATA__) frameworks.push("Next.js (__NEXT_DATA__ present)");
-  if (window.__NUXT__ || window.$nuxt) frameworks.push("Nuxt.js");
-  if (window.Vue || document.querySelector("[data-v-app]")) frameworks.push("Vue");
-  if (window.angular || document.querySelector("[ng-version]")) frameworks.push("Angular");
-  if (window.jQuery || window.$?.fn?.jquery) frameworks.push("jQuery");
-  if (window.Shopify) frameworks.push("Shopify");
+  // 2. Детектор современных фреймворков (React 18+ Fiber, Vue 3, Next.js, Nuxt, Webpack/Vite)
+  const frameworks = new Set();
+  if (
+    window.React ||
+    window.__REACT_DEVTOOLS_GLOBAL_HOOK__ ||
+    window.__reactResponderSystemActive ||
+    document.querySelector("[data-reactroot], [data-reactid], #react-root")
+  ) {
+    frameworks.add("React");
+  }
 
-  // Интересные не-стандартные переменные в window (полезно для поиска скрытых конфигов/API/читалок)
+  // Проверка DOM-корней на внутренние ключи React Fiber / Vue 3
+  const rootCandidates = [
+    document.getElementById("root"),
+    document.getElementById("app"),
+    document.getElementById("react-root"),
+    document.getElementById("__next"),
+    document.body?.firstElementChild,
+  ].filter(Boolean);
+
+  for (const node of rootCandidates) {
+    const keys = Object.keys(node);
+    if (keys.some((k) => k.startsWith("__reactContainer$") || k.startsWith("__reactFiber$"))) {
+      frameworks.add("React (Fiber 18+)");
+    }
+    if (keys.some((k) => k.startsWith("__vue_app__") || k === "__vue__")) {
+      frameworks.add("Vue.js");
+    }
+  }
+
+  if (window.__NEXT_DATA__) frameworks.add("Next.js (__NEXT_DATA__)");
+  if (window.__NUXT__ || window.$nuxt) frameworks.add("Nuxt.js");
+  if (window.Vue || document.querySelector("[data-v-app]")) frameworks.add("Vue.js");
+  if (window.angular || document.querySelector("[ng-version]")) frameworks.add("Angular");
+  if (window.jQuery || window.$?.fn?.jquery) frameworks.add("jQuery");
+  if (window.Shopify) frameworks.add("Shopify");
+  if (Object.keys(window).some((k) => k.startsWith("webpackChunk"))) frameworks.add("Webpack Bundler");
+
+  // Интересные нестандартные переменные в window
   const defaultGlobals = new Set([
     "window", "self", "document", "name", "location", "customElements", "history",
     "navigation", "locationbar", "menubar", "personalbar", "scrollbars", "statusbar",
@@ -73,19 +115,33 @@ function collectPageReconInMainWorld() {
     "ontouchcancel", "ontouchend", "ontouchmove", "ontouchstart", "getScreenDetails", "queryLocalFonts",
     "showDirectoryPicker", "showOpenFilePicker", "showSaveFilePicker", "originAgentCluster",
     "onpageswap", "onpagereveal", "credentialless", "fence", "speechSynthesis", "onscrollsnapchange",
-    "onscrollsnapchanging", "__AI_RECON_HOOKED__", "__AI_RECON_NET_LOG__"
+    "onscrollsnapchanging", "event", "oncommand", "onanimationcancel", "fetchLater", "viewport",
+    "ongamepadconnected", "ongamepaddisconnected", "__AI_RECON_HOOKED__", "__AI_RECON_NET_LOG__"
   ]);
 
   const customWindowKeys = Object.keys(window)
-    .filter((k) => !defaultGlobals.has(k) && !k.startsWith("webkit"))
+    .filter((k) => !defaultGlobals.has(k) && !k.startsWith("webkit") && !/^\d+$/.test(k))
     .slice(0, 60);
 
-  // 2. Сбор ключевых DOM-узлов и селекторов
-  const buildSkeleton = (root, depth = 0, maxDepth = 4) => {
+  // 3. Сбор ключевых семантических контейнеров и зон с data-testid (вместо пустых div-оберток)
+  const semanticLandmarks = Array.from(
+    document.querySelectorAll("main, nav, header, footer, article, section, [data-testid], [role='main'], [role='feed'], [role='region']")
+  )
+    .slice(0, 45)
+    .map((el) => ({
+      selector: getSelector(el),
+      tag: el.tagName.toLowerCase(),
+      testId: el.getAttribute("data-testid") || undefined,
+      role: el.getAttribute("role") || undefined,
+      ariaLabel: el.getAttribute("aria-label") || undefined,
+      childCount: el.children.length,
+    }));
+
+  const buildSkeleton = (root, depth = 0, maxDepth = 3) => {
     if (!root || depth > maxDepth) return null;
     const children = Array.from(root.children || [])
       .filter((el) => !["SCRIPT", "STYLE", "SVG", "NOSCRIPT", "LINK", "META"].includes(el.tagName))
-      .slice(0, 15);
+      .slice(0, 12);
 
     return {
       selector: getSelector(root),
@@ -100,52 +156,79 @@ function collectPageReconInMainWorld() {
     };
   };
 
-  // 3. Сбор интерактивных элементов (кнопки, инпуты, формы)
+  // 4. Сбор интерактивных элементов с извлечением data-testid, aria-label и title
   const interactiveElements = Array.from(
-    document.querySelectorAll("button, input, select, textarea, a[href], [role='button']")
+    document.querySelectorAll("button, input, select, textarea, a[href], [role='button'], [data-testid]")
   )
-    .slice(0, 50)
+    .filter((el) => {
+      const tag = el.tagName.toLowerCase();
+      return ["button", "input", "select", "textarea", "a"].includes(tag) || el.getAttribute("role") === "button";
+    })
+    .slice(0, 55)
     .map((el) => ({
       selector: getSelector(el),
       tag: el.tagName.toLowerCase(),
       type: el.getAttribute("type") || undefined,
+      testId: el.getAttribute("data-testid") || undefined,
+      ariaLabel: el.getAttribute("aria-label") || el.getAttribute("title") || undefined,
       name: el.getAttribute("name") || undefined,
       placeholder: el.getAttribute("placeholder") || undefined,
       text: (el.innerText || el.value || "").trim().replace(/\s+/g, " ").slice(0, 60),
       href: el.getAttribute("href") ? el.getAttribute("href").slice(0, 120) : undefined,
     }));
 
-  // 4. Сбор медиа-элементов и картинок (особенно важно для парсеров манги/видео)
-  const images = Array.from(document.querySelectorAll("img, canvas, picture source"))
-    .slice(0, 40)
-    .map((el) => ({
+  // 5. Сбор медиа-элементов с фильтрацией мелких иконок/эмодзи и дедупликацией
+  const seenImgSrc = new Set();
+  const contentImages = [];
+  const smallIconsOrAvatars = [];
+
+  for (const el of document.querySelectorAll("img, canvas, picture source")) {
+    const src = el.currentSrc || el.src || el.getAttribute("data-src") || el.getAttribute("srcset") || null;
+    if (!src || seenImgSrc.has(src)) continue;
+    // Пропускаем встроенные мелкие эмодзи
+    if (src.includes("/emoji/") || src.startsWith("data:image/svg")) continue;
+    seenImgSrc.add(src);
+
+    const w = el.naturalWidth || el.width || el.clientWidth || 0;
+    const h = el.naturalHeight || el.height || el.clientHeight || 0;
+    const item = {
       selector: getSelector(el),
       parentSelector: getSelector(el.parentElement),
-      src: el.currentSrc || el.src || el.getAttribute("data-src") || el.getAttribute("srcset") || null,
-      width: el.width || el.clientWidth || 0,
-      height: el.height || el.clientHeight || 0,
-      loading: el.getAttribute("loading") || undefined,
-    }));
+      src,
+      width: w,
+      height: h,
+      alt: el.getAttribute("alt") ? el.getAttribute("alt").slice(0, 40) : undefined,
+    };
+
+    if (w >= 100 || h >= 100) {
+      if (contentImages.length < 30) contentImages.push(item);
+    } else {
+      if (smallIconsOrAvatars.length < 15) smallIconsOrAvatars.push(item);
+    }
+  }
 
   const videosAndStreams = Array.from(document.querySelectorAll("video, audio, video source, iframe"))
     .slice(0, 25)
     .map((el) => ({
       selector: getSelector(el),
+      parentSelector: getSelector(el.parentElement),
       src: el.currentSrc || el.src || el.getAttribute("data-src") || null,
+      poster: el.getAttribute("poster") || undefined,
     }));
 
-  // 5. Сетевая активность из Performance API (включая m3u8, mp4, webp, json, api)
+  // 6. Сетевая активность из Performance API (расширенный фильтр: graphql, /i/api/, m4s, m3u8, mpd)
   const perfResources = (performance.getEntriesByType("resource") || [])
     .filter((r) => {
       const u = r.name.toLowerCase();
       return (
         r.initiatorType === "fetch" ||
         r.initiatorType === "xmlhttprequest" ||
+        u.includes("graphql") ||
+        u.includes("api") ||
         u.includes(".m3u8") ||
         u.includes(".mpd") ||
+        u.includes(".m4s") ||
         u.includes(".mp4") ||
-        u.includes("/api/") ||
-        u.includes("graphql") ||
         u.includes(".json")
       );
     })
@@ -157,20 +240,31 @@ function collectPageReconInMainWorld() {
       transferSize: r.transferSize || 0,
     }));
 
-  // 6. Хранилища: localStorage и sessionStorage (только ключи и превью значений)
+  // 7. Хранилища с автоматической маскировкой приватных токенов (JWT, auth, session, secret)
+  const SENSITIVE_KEY_RE = /(token|jwt|auth|secret|password|passwd|session|sess|cookie|apikey|api_key|bearer)/i;
+  const JWT_VALUE_RE = /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/;
+
+  const maskValueIfNeeded = (key, val) => {
+    if (typeof val !== "string") return val;
+    if (SENSITIVE_KEY_RE.test(key) || JWT_VALUE_RE.test(val.trim())) {
+      return `[REDACTED_SENSITIVE_VALUE (len=${val.length})]`;
+    }
+    return val.length > 250 ? val.slice(0, 250) + "... [обрезано]" : val;
+  };
+
   const dumpStorage = (store) => {
     const out = {};
     try {
       for (let i = 0; i < Math.min(store.length, 35); i++) {
         const key = store.key(i);
         const val = store.getItem(key) || "";
-        out[key] = val.length > 250 ? val.slice(0, 250) + "... [обрезано]" : val;
+        out[key] = maskValueIfNeeded(key, val);
       }
     } catch (_) {}
     return out;
   };
 
-  // 7. JSON-скрипты внутри страницы (__NEXT_DATA__, application/ld+json и т.д.)
+  // 8. JSON-скрипты внутри страницы (__NEXT_DATA__, application/ld+json и т.д.)
   const inlineJsonScripts = Array.from(
     document.querySelectorAll('script[type="application/json"], script[type="application/ld+json"], script#__NEXT_DATA__')
   )
@@ -192,16 +286,18 @@ function collectPageReconInMainWorld() {
       viewport: { width: window.innerWidth, height: window.innerHeight },
     },
     techStack: {
-      detectedFrameworks: frameworks,
+      detectedFrameworks: Array.from(frameworks),
       customWindowGlobals: customWindowKeys,
       inlineJsonScripts,
     },
     domStructure: {
-      skeleton: buildSkeleton(document.body, 0, 3),
+      semanticLandmarks,
       interactiveElements,
+      skeleton: buildSkeleton(document.body, 0, 3),
     },
     mediaAndAssets: {
-      images,
+      contentImages,
+      smallIconsOrAvatars,
       videosAndStreams,
     },
     network: {
@@ -212,7 +308,7 @@ function collectPageReconInMainWorld() {
       localStorage: dumpStorage(window.localStorage),
       sessionStorage: dumpStorage(window.sessionStorage),
       cookieNames: document.cookie
-        ? document.cookie.split(";").map((c) => c.split("=")[0].trim()).filter(Boolean)
+        ? Array.from(new Set(document.cookie.split(";").map((c) => c.split("=")[0].trim()).filter(Boolean)))
         : [],
     },
   };
@@ -228,7 +324,7 @@ function formatAsAiMarkdown(report) {
     `- **Custom Window Globals**: \`${report.techStack.customWindowGlobals.slice(0, 30).join("`, `")}\``,
     "",
     "## Контекст для ИИ",
-    "Ниже находится полный технический слепок веб-страницы (DOM-селекторы, медиа-контейнеры, перехваченные запросы Fetch/XHR с заголовками и ответами, а также ключи localStorage/cookies). Используй эти реальные селекторы и эндпоинты для написания расширения, парсера или пользовательского скрипта без выдумывания несуществующих классов.",
+    "Ниже находится полный технический слепок веб-страницы (семантические узлы с `data-testid` и `aria-label`, крупные медиа-контейнеры, перехваченные запросы Fetch/XHR и GraphQL, а также ключи localStorage/cookies с замаскированными секретами). Используй эти реальные селекторы и эндпоинты для написания расширения, парсера или пользовательского скрипта без выдумывания несуществующих классов.",
     "",
     "```json",
     JSON.stringify(report, null, 2),
@@ -237,7 +333,7 @@ function formatAsAiMarkdown(report) {
 }
 
 scanBtn.addEventListener("click", async () => {
-  statusEl.textContent = "⏳ Сканирую DOM, сеть и хранилища...";
+  statusEl.textContent = "⏳ Сканирую DOM, Fiber, сеть и хранилища...";
   scanBtn.disabled = true;
 
   try {
@@ -257,7 +353,7 @@ scanBtn.addEventListener("click", async () => {
       throw new Error("Не удалось собрать данные со страницы (возможно, это системная страница chrome://).");
     }
 
-    // Дополним именами httpOnly кук через chrome.cookies API, если есть доступ
+    // Дополним метаданными кук через chrome.cookies API (без значений, только имена и флаги)
     try {
       const allCookies = await chrome.cookies.getAll({ url: tab.url });
       report.storage.allCookieMeta = allCookies.map((c) => ({
@@ -271,24 +367,24 @@ scanBtn.addEventListener("click", async () => {
     latestReport = report;
     latestMarkdown = formatAsAiMarkdown(report);
 
-    // Автоматически копируем готовый промпт в буфер обмена сразу после нажатия большой кнопки!
+    // Автоматически копируем готовый промпт в буфер обмена сразу после нажатия большой кнопки
     await navigator.clipboard.writeText(latestMarkdown);
 
     const netCount =
       (report.network.interceptedRequests?.length || 0) +
       (report.network.performanceResourceEntries?.length || 0);
-    const imgCount = report.mediaAndAssets.images?.length || 0;
+    const imgCount = report.mediaAndAssets.contentImages?.length || 0;
 
-    statusEl.textContent = `✅ Готово! Скопировано в буфер (Сеть: ${netCount}, Медиа: ${imgCount})`;
+    statusEl.textContent = `✅ Скопировано! (Сеть: ${netCount}, Контент-медиа: ${imgCount})`;
     previewEl.style.display = "block";
     previewEl.textContent = JSON.stringify(
       {
         url: report.meta.url,
         frameworks: report.techStack.detectedFrameworks,
+        landmarksFound: report.domStructure.semanticLandmarks.length,
         interceptedRequests: report.network.interceptedRequests.length,
         perfEntries: report.network.performanceResourceEntries.length,
-        imagesSampled: imgCount,
-        globalsSample: report.techStack.customWindowGlobals.slice(0, 10),
+        contentImages: imgCount,
       },
       null,
       2
