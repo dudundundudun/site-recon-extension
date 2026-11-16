@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Site Recon for AI</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --card: #181b22;
+      --border: #2a2f3a;
+      --text: #e6e8ee;
+      --muted: #949ba6;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --success: #10b981;
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      width: 390px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 16px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    .title {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+    }
+    .badge {
+      font-size: 11px;
+      background: #1e293b;
+      color: #60a5fa;
+      padding: 3px 8px;
+      border-radius: 99px;
+      border: 1px solid #334155;
+    }
+    .big-btn {
+      width: 100%;
+      padding: 16px 14px;
+      font-size: 15px;
+      font-weight: 700;
+      color: #fff;
+      background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(59, 130, 246, 0.35);
+      transition: transform 0.1s ease, background 0.15s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .big-btn:hover {
+      background: linear-gradient(135deg, #2563eb 0%, #1e40af 100%);
+    }
+    .big-btn:active {
+      transform: scale(0.985);
+    }
+    .status {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+      text-align: center;
+      min-height: 18px;
+    }
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .small-btn {
+      padding: 8px 6px;
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--text);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .small-btn:hover:not(:disabled) {
+      background: #222731;
+      border-color: #3b82f6;
+    }
+    .small-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .preview-box {
+      margin-top: 12px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 11px;
+      color: #cbd5e1;
+      max-height: 210px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">⚡ Разведчик сайта для ИИ</div>
+    <span class="badge">MV3 Recon</span>
+  </div>
+
+  <!-- ОДНА БОЛЬШАЯ КНОПКА -->
+  <button id="scanBtn" class="big-btn">
+    <span>🚀 СДЕЛАТЬ ПОЛНЫЙ СЛЕПОК САЙТА</span>
+  </button>
+
+  <div id="status" class="status">Нажми кнопку, чтобы собрать архитектуру страницы</div>
+
+  <!-- ТРИ МАЛЕНЬКИЕ КНОПКИ ЭКСПОРТА -->
+  <div class="actions">
+    <button id="copyAiBtn" class="small-btn" disabled>📋 Промпт ИИ</button>
+    <button id="copyJsonBtn" class="small-btn" disabled>{ } JSON</button>
+    <button id="downloadBtn" class="small-btn" disabled>💾 Скачать</button>
+  </div>
+
+  <pre id="preview" class="preview-box"></pre>
+
+  <script src="popup.js"></script>
+</body>
+</html>
