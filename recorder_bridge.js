@@ -6,6 +6,7 @@
 
   let isRecording = false;
   let lastUrl = location.href;
+  let navPollTimer = null;
 
   function formatIdSelector(tag, id) {
     if (/^[A-Za-z_-][A-Za-z0-9_-]*$/.test(id)) return `${tag}#${id}`;
@@ -100,11 +101,51 @@
     });
   }
 
+  function checkNavigation() {
+    if (!isRecording) return;
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      setTimeout(sendPageVisit, 600);
+    }
+  }
+
+  function startNavPolling() {
+    if (navPollTimer !== null) return;
+    lastUrl = location.href;
+    navPollTimer = setInterval(checkNavigation, 1000);
+  }
+
+  function stopNavPolling() {
+    if (navPollTimer === null) return;
+    clearInterval(navPollTimer);
+    navPollTimer = null;
+  }
+
+  function syncInterceptorRecordingState(active) {
+    try {
+      if (!location.origin || location.origin === "null") return;
+      window.postMessage(
+        { __aiReconControl: true, type: "SET_RECORDING", active: Boolean(active) },
+        location.origin
+      );
+    } catch (_) {}
+  }
+
+  function setRecordingState(active) {
+    isRecording = Boolean(active);
+    syncInterceptorRecordingState(isRecording);
+    if (isRecording) {
+      startNavPolling();
+    } else {
+      stopNavPolling();
+    }
+  }
+
   try {
     chrome.runtime.sendMessage({ type: "RECON_GET_STATUS" }, (res) => {
       if (chrome.runtime.lastError) return;
       if (res && res.active) {
-        isRecording = true;
+        setRecordingState(true);
         if (document.readyState === "loading") {
           document.addEventListener("DOMContentLoaded", () => setTimeout(sendPageVisit, 400), { once: true });
         } else {
@@ -116,7 +157,7 @@
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === "RECON_RECORDING_STATE") {
-      isRecording = Boolean(msg.active);
+      setRecordingState(msg.active);
       if (isRecording) {
         sendPageVisit();
       }
@@ -124,7 +165,12 @@
   });
 
   window.addEventListener("message", (event) => {
-    if (event.source !== window || !event.data || !event.data.__aiReconEvent) return;
+    if (
+      event.source !== window ||
+      (location.origin && location.origin !== "null" && event.origin !== location.origin) ||
+      !event.data ||
+      !event.data.__aiReconEvent
+    ) return;
     if (!isRecording) return;
     if (event.data.kind === "net") {
       sendEvent("net", event.data.entry);
@@ -133,13 +179,33 @@
     }
   });
 
+  const SENSITIVE_INPUT_TYPE_RE = /^(password|email|tel|hidden)$/i;
+  const SENSITIVE_INPUT_ATTR_RE = /(password|pass|token|secret|csrf|otp|card|cvv|cc-)/i;
+
+  function isSensitiveInput(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName.toLowerCase();
+    if (tag !== "input" && tag !== "textarea") return false;
+    const type = (el.getAttribute("type") || "").trim();
+    if (SENSITIVE_INPUT_TYPE_RE.test(type)) return true;
+    const attrs = [
+      el.getAttribute("name") || "",
+      el.getAttribute("id") || "",
+      el.getAttribute("autocomplete") || "",
+    ].join(" ");
+    return SENSITIVE_INPUT_ATTR_RE.test(attrs);
+  }
+
   document.addEventListener(
     "click",
     (e) => {
       if (!isRecording) return;
-      const target = e.target?.closest?.("button, a, input, select, [role='button'], [data-widget], [data-testid], [data-auto]");
+      const target = e.target?.closest?.("button, a, input, select, textarea, [role='button'], [data-widget], [data-testid], [data-auto]");
       if (!target) return;
-      const text = (target.innerText || target.value || "").trim().replace(/\s+/g, " ").slice(0, 50);
+      const rawText = isSensitiveInput(target)
+        ? (target.value ? "[REDACTED_INPUT]" : "")
+        : (target.innerText || target.value || "");
+      const text = rawText.trim().replace(/\s+/g, " ").slice(0, 50);
       sendEvent("action", {
         type: "click",
         selector: getCompactSelector(target),
@@ -166,14 +232,7 @@
     true
   );
 
-  const checkNavigation = () => {
-    if (!isRecording) return;
-    if (location.href !== lastUrl) {
-      lastUrl = location.href;
-      setTimeout(sendPageVisit, 600);
-    }
-  };
   window.addEventListener("popstate", checkNavigation);
   window.addEventListener("hashchange", checkNavigation);
-  setInterval(checkNavigation, 1000);
+  window.addEventListener("pagehide", stopNavPolling);
 })();

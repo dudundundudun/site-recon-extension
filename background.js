@@ -7,6 +7,14 @@ const MAX_ENDPOINTS = 80;
 const MAX_WS = 20;
 const MAX_WIDGETS = 100;
 
+let writeQueue = Promise.resolve();
+
+function enqueueSessionOp(fn) {
+  const next = writeQueue.then(fn, fn);
+  writeQueue = next.catch(() => {});
+  return next;
+}
+
 function createEmptySession(tabId, origin, url) {
   return {
     active: true,
@@ -42,13 +50,20 @@ async function updateBadge(active) {
   } catch (_) {}
 }
 
+function hasMatchingOrigin(url, targetOrigin) {
+  if (!url || !targetOrigin) return false;
+  try {
+    return new URL(url).origin === targetOrigin;
+  } catch (_) {
+    return false;
+  }
+}
+
 function isMatchingSessionTab(session, tab) {
   if (!session || !session.active || !tab) return false;
   if (tab.id === session.tabId) return true;
   if (session.origin && tab.url) {
-    try {
-      return new URL(tab.url).origin === session.origin;
-    } catch (_) {}
+    return hasMatchingOrigin(tab.url, session.origin);
   }
   return false;
 }
@@ -103,8 +118,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         origin = new URL(url).origin;
       } catch (_) {}
 
-      const session = createEmptySession(tabId, origin, url);
-      await saveSession(session);
+      const session = await enqueueSessionOp(async () => {
+        const nextSession = createEmptySession(tabId, origin, url);
+        await saveSession(nextSession);
+        return nextSession;
+      });
       await updateBadge(true);
 
       try {
@@ -116,21 +134,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     if (msg.type === "RECON_STOP_RECORDING") {
-      const session = await getSession();
+      const session = await enqueueSessionOp(async () => {
+        const current = await getSession();
+        if (!current) return null;
+        current.active = false;
+        current.stoppedAt = new Date().toISOString();
+        await saveSession(current);
+        return current;
+      });
+
+      await updateBadge(false);
+
       if (!session) {
-        await updateBadge(false);
         sendResponse({ session: null });
         return;
       }
-      session.active = false;
-      session.stoppedAt = new Date().toISOString();
-      await saveSession(session);
-      await updateBadge(false);
 
       try {
         const tabs = await chrome.tabs.query({});
         for (const t of tabs) {
-          if (t.id && (t.id === session.tabId || (session.origin && t.url?.startsWith(session.origin)))) {
+          if (t.id && (t.id === session.tabId || hasMatchingOrigin(t.url, session.origin))) {
             chrome.tabs.sendMessage(t.id, { type: "RECON_RECORDING_STATE", active: false }).catch(() => {});
           }
         }
@@ -153,78 +176,81 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     if (msg.type === "RECON_EVENT" && sender.tab) {
-      const session = await getSession();
-      if (!isMatchingSessionTab(session, sender.tab)) {
-        sendResponse({ ok: false });
-        return;
-      }
+      const result = await enqueueSessionOp(async () => {
+        const session = await getSession();
+        if (!isMatchingSessionTab(session, sender.tab)) {
+          return { ok: false };
+        }
 
-      const { kind, payload } = msg;
+        const { kind, payload } = msg;
 
-      if (kind === "page_visit" && payload) {
-        const existingSet = new Set(session.seenWidgets);
-        const newWidgets = [];
-        for (const w of payload.widgets || []) {
-          if (!existingSet.has(w) && session.seenWidgets.length < MAX_WIDGETS) {
-            existingSet.add(w);
-            session.seenWidgets.push(w);
-            newWidgets.push(w);
+        if (kind === "page_visit" && payload) {
+          const existingSet = new Set(session.seenWidgets);
+          const newWidgets = [];
+          for (const w of payload.widgets || []) {
+            if (!existingSet.has(w) && session.seenWidgets.length < MAX_WIDGETS) {
+              existingSet.add(w);
+              session.seenWidgets.push(w);
+              newWidgets.push(w);
+            }
+          }
+
+          const lastPage = session.pages[session.pages.length - 1];
+          if (!lastPage || lastPage.url !== payload.url) {
+            if (session.pages.length < MAX_PAGES) {
+              session.pages.push({
+                url: payload.url,
+                pathname: payload.pathname,
+                title: payload.title,
+                timestamp: payload.timestamp,
+                newWidgets,
+              });
+            }
+          } else if (newWidgets.length > 0) {
+            lastPage.newWidgets = Array.from(new Set([...lastPage.newWidgets, ...newWidgets]));
+          }
+        } else if (kind === "action" && payload) {
+          if (session.actions.length < MAX_ACTIONS) {
+            session.actions.push(payload);
+          }
+        } else if (kind === "net" && payload) {
+          const key = getEndpointKey(payload.method, payload.url);
+          const existing = session.endpoints[key];
+          if (existing) {
+            existing.count += 1;
+            existing.lastStatus = payload.status;
+          } else if (Object.keys(session.endpoints).length < MAX_ENDPOINTS) {
+            let pathname = payload.url;
+            try {
+              pathname = new URL(payload.url, session.origin || "https://placeholder.local").pathname;
+            } catch (_) {}
+            session.endpoints[key] = {
+              method: payload.method,
+              pathname,
+              sampleUrl: payload.url,
+              status: payload.status,
+              contentType: payload.contentType || "",
+              count: 1,
+              firstSeenAt: new Date().toISOString(),
+              requestHeaders: payload.requestHeaders || {},
+              requestBodyPreview: payload.requestBody || null,
+              responsePreview: payload.responsePreview || null,
+            };
+          }
+        } else if (kind === "ws" && payload) {
+          if (
+            session.webSockets.length < MAX_WS &&
+            !session.webSockets.some((w) => w.url === payload.url)
+          ) {
+            session.webSockets.push(payload);
           }
         }
 
-        const lastPage = session.pages[session.pages.length - 1];
-        if (!lastPage || lastPage.url !== payload.url) {
-          if (session.pages.length < MAX_PAGES) {
-            session.pages.push({
-              url: payload.url,
-              pathname: payload.pathname,
-              title: payload.title,
-              timestamp: payload.timestamp,
-              newWidgets,
-            });
-          }
-        } else if (newWidgets.length > 0) {
-          lastPage.newWidgets = Array.from(new Set([...lastPage.newWidgets, ...newWidgets]));
-        }
-      } else if (kind === "action" && payload) {
-        if (session.actions.length < MAX_ACTIONS) {
-          session.actions.push(payload);
-        }
-      } else if (kind === "net" && payload) {
-        const key = getEndpointKey(payload.method, payload.url);
-        const existing = session.endpoints[key];
-        if (existing) {
-          existing.count += 1;
-          existing.lastStatus = payload.status;
-        } else if (Object.keys(session.endpoints).length < MAX_ENDPOINTS) {
-          let pathname = payload.url;
-          try {
-            pathname = new URL(payload.url, session.origin || "https://placeholder.local").pathname;
-          } catch (_) {}
-          session.endpoints[key] = {
-            method: payload.method,
-            pathname,
-            sampleUrl: payload.url,
-            status: payload.status,
-            contentType: payload.contentType || "",
-            count: 1,
-            firstSeenAt: new Date().toISOString(),
-            requestHeaders: payload.requestHeaders || {},
-            requestBodyPreview: payload.requestBody || null,
-            responsePreview: payload.responsePreview || null,
-          };
-        }
-      } else if (kind === "ws" && payload) {
-        if (
-          session.webSockets.length < MAX_WS &&
-          !session.webSockets.some((w) => w.url === payload.url)
-        ) {
-          session.webSockets.push(payload);
-        }
-      }
+        await saveSession(session);
+        return { ok: true };
+      });
 
-      await saveSession(session);
-      sendResponse({ ok: true });
+      sendResponse(result);
     }
   })();
 

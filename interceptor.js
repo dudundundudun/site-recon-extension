@@ -14,9 +14,37 @@
   const MAX_WS_MESSAGES_PER_SOCKET = 10;
 
   const SENSITIVE_HEADER_RE =
-    /^(authorization|cookie|set-cookie|x-csrf-token|x-xsrf-token|x-auth-token|x-access-token|x-session-token|api-key|x-api-key|x-api-token)$/i;
+    /^(authorization|proxy-authorization|cookie|set-cookie|x-csrf|x-csrf-token|x-xsrf-token|x-auth-token|x-access-token|x-session-token|x-token|x-secret|x-user-token|api-key|x-api-key|x-api-token)$/i;
   const SENSITIVE_TOKEN_RE =
-    /(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"token"\s*:\s*"[^"]+"|"auth"\s*:\s*"[^"]+"|"password"\s*:\s*"[^"]+")/gi;
+    /(Bearer\s+[A-Za-z0-9._~+/=-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"(?:token|access_token|refresh_token|auth|password|api_key|apiKey|secret)"\s*:\s*"[^"]*")/gi;
+  const SENSITIVE_QUERY_PARAM_RE =
+    /^(token|access_token|refresh_token|api_key|apikey|key|auth|secret|sig|signature|session|password)$/i;
+  const SENSITIVE_FORM_PAIR_RE =
+    /(^|[&?])(password|passwd|token|access_token|refresh_token|api_key|apikey|auth|secret|session)=([^&#\s"']*)/gi;
+
+  function sanitizeUrl(rawUrl) {
+    if (typeof rawUrl !== "string" || !rawUrl) return rawUrl;
+    if (!rawUrl.includes("?") && !rawUrl.includes("#")) return rawUrl;
+    try {
+      const baseHref = typeof location !== "undefined" && location.href ? location.href : "https://placeholder.local";
+      const isRelative = !/^[a-z][a-z0-9+.-]*:/i.test(rawUrl);
+      const u = new URL(rawUrl, baseHref);
+      let changed = false;
+      for (const [k] of Array.from(u.searchParams.entries())) {
+        if (SENSITIVE_QUERY_PARAM_RE.test(k)) {
+          u.searchParams.set(k, "[REDACTED]");
+          changed = true;
+        }
+      }
+      if (!changed) return rawUrl;
+      return isRelative ? `${u.pathname}${u.search}${u.hash}` : u.toString();
+    } catch (_) {
+      return rawUrl.replace(
+        /([?&](?:token|access_token|refresh_token|api_key|apikey|key|auth|secret|sig|signature|session|password)=)[^&#]*/gi,
+        "$1[REDACTED]"
+      );
+    }
+  }
 
   // Фильтр телеметрии, трекинг-пикселей и статики, чтобы не забивать буфер API-запросов
   const NOISE_URL_RE =
@@ -37,7 +65,9 @@
 
   function safePreview(text) {
     if (typeof text !== "string") return null;
-    const masked = text.replace(SENSITIVE_TOKEN_RE, "[REDACTED_TOKEN]");
+    const masked = text
+      .replace(SENSITIVE_TOKEN_RE, "[REDACTED_TOKEN]")
+      .replace(SENSITIVE_FORM_PAIR_RE, "$1$2=[REDACTED_TOKEN]");
     return masked.length > MAX_BODY_PREVIEW
       ? masked.slice(0, MAX_BODY_PREVIEW) + "... [обрезано]"
       : masked;
@@ -46,7 +76,13 @@
   function formatRequestBody(body) {
     if (body == null) return null;
     if (typeof body === "string") return safePreview(body);
-    if (body instanceof URLSearchParams) return safePreview(body.toString());
+    if (body instanceof URLSearchParams) {
+      const sanitized = new URLSearchParams();
+      body.forEach((v, k) => {
+        sanitized.append(k, SENSITIVE_QUERY_PARAM_RE.test(k) ? "[REDACTED_TOKEN]" : v);
+      });
+      return safePreview(sanitized.toString());
+    }
     if (typeof FormData !== "undefined" && body instanceof FormData) {
       const keys = [];
       body.forEach((_, k) => keys.push(k));
@@ -94,7 +130,28 @@
     return clean;
   }
 
+  let isRecordingBridgeActive = false;
+
+  function getTargetOrigin() {
+    try {
+      return location.origin && location.origin !== "null" ? location.origin : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  window.addEventListener("message", (event) => {
+    const targetOrigin = getTargetOrigin();
+    if (event.source !== window || (targetOrigin && event.origin !== targetOrigin)) return;
+    if (event.data && event.data.__aiReconControl === true && event.data.type === "SET_RECORDING") {
+      isRecordingBridgeActive = Boolean(event.data.active);
+    }
+  });
+
   function emitToBridge(kind, payload) {
+    if (!isRecordingBridgeActive) return;
+    const targetOrigin = getTargetOrigin();
+    if (!targetOrigin) return;
     try {
       window.postMessage(
         {
@@ -102,12 +159,15 @@
           kind,
           ...(kind === "net" ? { entry: payload } : { ws: payload }),
         },
-        "*"
+        targetOrigin
       );
     } catch (_) {}
   }
 
   function pushLog(entry) {
+    if (entry && typeof entry.url === "string") {
+      entry.url = sanitizeUrl(entry.url);
+    }
     if (isNoiseRequest(entry.url, entry.contentType)) {
       window.__AI_RECON_FILTERED_COUNT__++;
       return;
@@ -139,13 +199,23 @@
         } else if (resource && typeof resource.url === "string") {
           url = resource.url;
           method = resource.method || method;
+          if (
+            (typeof Request !== "undefined" && resource instanceof Request) ||
+            (resource.headers && typeof resource.headers.forEach === "function")
+          ) {
+            resource.headers.forEach((v, k) => (reqHeaders[k] = v));
+          }
         }
         if (init.method) method = init.method;
         if (init.headers) {
           if (init.headers instanceof Headers) {
             init.headers.forEach((v, k) => (reqHeaders[k] = v));
+          } else if (Array.isArray(init.headers)) {
+            for (const pair of init.headers) {
+              if (Array.isArray(pair) && pair.length >= 2) reqHeaders[pair[0]] = pair[1];
+            }
           } else if (typeof init.headers === "object") {
-            reqHeaders = { ...init.headers };
+            reqHeaders = { ...reqHeaders, ...init.headers };
           }
         }
         if (init.body !== undefined) {
@@ -157,47 +227,50 @@
 
       try {
         const response = await origFetch.apply(this, args);
-        const clone = response.clone();
-        const contentType = clone.headers.get("content-type") || "";
+        const contentType = response.headers ? response.headers.get("content-type") || "" : "";
+        const contentTypeLower = contentType.toLowerCase();
+        const contentLength = Number(response.headers ? response.headers.get("content-length") || 0 : 0);
 
         if (isNoiseRequest(url, contentType)) {
           window.__AI_RECON_FILTERED_COUNT__++;
           return response;
         }
 
-        if (
-          contentType.includes("json") ||
-          contentType.includes("text") ||
-          contentType.includes("xml") ||
-          contentType.includes("mpegurl")
+        const baseLog = {
+          type: "fetch",
+          method: method.toUpperCase(),
+          url,
+          status: response.status,
+          contentType,
+          durationMs: Date.now() - startTime,
+          requestHeaders: cleanHeaders,
+          requestBody: reqBody,
+        };
+
+        if (response.type === "opaque" || response.bodyUsed) {
+          pushLog(baseLog);
+        } else if (contentTypeLower.includes("text/event-stream")) {
+          pushLog({ ...baseLog, responsePreview: "[SSE stream skipped]" });
+        } else if (Number.isFinite(contentLength) && contentLength > 2000000) {
+          pushLog({ ...baseLog, responsePreview: "[Skipped large response]" });
+        } else if (
+          contentTypeLower.includes("json") ||
+          contentTypeLower.includes("text") ||
+          contentTypeLower.includes("xml") ||
+          contentTypeLower.includes("mpegurl")
         ) {
+          const clone = response.clone();
           clone
             .text()
             .then((txt) => {
               pushLog({
-                type: "fetch",
-                method: method.toUpperCase(),
-                url,
-                status: response.status,
-                contentType,
-                durationMs: Date.now() - startTime,
-                requestHeaders: cleanHeaders,
-                requestBody: reqBody,
+                ...baseLog,
                 responsePreview: safePreview(txt),
               });
             })
             .catch(() => {});
         } else {
-          pushLog({
-            type: "fetch",
-            method: method.toUpperCase(),
-            url,
-            status: response.status,
-            contentType,
-            durationMs: Date.now() - startTime,
-            requestHeaders: cleanHeaders,
-            requestBody: reqBody,
-          });
+          pushLog(baseLog);
         }
         return response;
       } catch (err) {
@@ -280,7 +353,7 @@
 
       try {
         const wsRecord = {
-          url: String(url || ""),
+          url: sanitizeUrl(String(url || "")),
           protocols: protocols || null,
           createdAt: new Date().toISOString(),
           readyState: wsInstance.readyState,

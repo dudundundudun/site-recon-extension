@@ -1,4 +1,7 @@
-// popup.js — логика сбора полного слепка страницы, режима записи сессии и генерации отчета для ИИ (v1.5)
+// popup.js — логика сбора полного слепка страницы, режима записи сессии и генерации отчета для ИИ (v1.4.0)
+
+const EXTENSION_VERSION = "1.4.0";
+const MAX_REPORT_BYTES = 180 * 1024;
 
 let latestReport = null;
 let latestMarkdown = "";
@@ -14,6 +17,8 @@ const previewEl = document.getElementById("preview");
 
 // Функция, которая выполняется внутри страницы (в MAIN world), чтобы иметь доступ к window и перехваченным логам
 function collectPageReconInMainWorld() {
+  const MAX_SHADOW_DEPTH = 3;
+  const MAX_SHADOW_ROOTS = 60;
   const EXT_NODE_RE = /^(protonpass-|grammarly-|lt-highlighter|darkreader|__darkreader)/i;
   const isExtensionNode = (el) => {
     if (!el || el.nodeType !== 1) return false;
@@ -25,6 +30,116 @@ function collectPageReconInMainWorld() {
       }
     }
     return false;
+  };
+
+  const collectShadowRoots = (rootNode = document, maxDepth = MAX_SHADOW_DEPTH) => {
+    const roots = [rootNode];
+    const seen = new Set([rootNode]);
+    const queue = [{ root: rootNode, depth: 0 }];
+
+    while (queue.length > 0 && roots.length < MAX_SHADOW_ROOTS) {
+      const { root, depth } = queue.shift();
+      if (depth >= maxDepth) continue;
+      let elements;
+      try {
+        elements = root.querySelectorAll("*");
+      } catch (_) {
+        continue;
+      }
+      for (const el of elements) {
+        if (isExtensionNode(el)) continue;
+        const sr = el.shadowRoot;
+        if (sr && !seen.has(sr)) {
+          seen.add(sr);
+          roots.push(sr);
+          if (roots.length >= MAX_SHADOW_ROOTS) break;
+          queue.push({ root: sr, depth: depth + 1 });
+        }
+      }
+    }
+    return roots;
+  };
+
+  const allDomRoots = collectShadowRoots(document, MAX_SHADOW_DEPTH);
+
+  const queryAllDeep = (selector) => {
+    const results = [];
+    for (const root of allDomRoots) {
+      try {
+        for (const el of root.querySelectorAll(selector)) {
+          results.push(el);
+        }
+      } catch (_) {}
+    }
+    return results;
+  };
+
+  const isInsideShadowDom = (el) => {
+    try {
+      const root = el?.getRootNode?.();
+      return Boolean(root && root !== document && root.host);
+    } catch (_) {
+      return false;
+    }
+  };
+
+  const getParentOrHost = (node) => {
+    if (!node) return null;
+    if (node.parentElement) return node.parentElement;
+    try {
+      const root = node.getRootNode?.();
+      if (root && root !== document && root.host) return root.host;
+    } catch (_) {}
+    return null;
+  };
+
+  const SENSITIVE_INPUT_TYPE_RE = /^(password|email|tel|hidden)$/i;
+  const SENSITIVE_INPUT_ATTR_RE = /(password|pass|token|secret|csrf|otp|card|cvv|cc-)/i;
+  const SENSITIVE_QUERY_PARAM_RE =
+    /^(token|access_token|refresh_token|api_key|apikey|key|auth|secret|sig|signature|session|password)$/i;
+  const INLINE_SECRET_RE =
+    /(Bearer\s+[A-Za-z0-9._~+/=-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"(?:token|access_token|refresh_token|auth|password|passwd|api_key|apiKey|secret|csrf|session|sessionId)"\s*:\s*"[^"]*")/gi;
+
+  const isSensitiveInput = (el) => {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName.toLowerCase();
+    if (tag !== "input" && tag !== "textarea") return false;
+    const type = (el.getAttribute("type") || "").trim();
+    if (SENSITIVE_INPUT_TYPE_RE.test(type)) return true;
+    const attrs = [
+      el.getAttribute("name") || "",
+      el.getAttribute("id") || "",
+      el.getAttribute("autocomplete") || "",
+    ].join(" ");
+    return SENSITIVE_INPUT_ATTR_RE.test(attrs);
+  };
+
+  const sanitizeUrl = (rawUrl) => {
+    if (typeof rawUrl !== "string" || !rawUrl) return rawUrl;
+    if (!rawUrl.includes("?") && !rawUrl.includes("#")) return rawUrl;
+    try {
+      const isRelative = !/^[a-z][a-z0-9+.-]*:/i.test(rawUrl);
+      const u = new URL(rawUrl, location.href);
+      let changed = false;
+      for (const [k] of Array.from(u.searchParams.entries())) {
+        if (SENSITIVE_QUERY_PARAM_RE.test(k)) {
+          u.searchParams.set(k, "[REDACTED]");
+          changed = true;
+        }
+      }
+      if (!changed) return rawUrl;
+      return isRelative ? `${u.pathname}${u.search}${u.hash}` : u.toString();
+    } catch (_) {
+      return rawUrl.replace(
+        /([?&](?:token|access_token|refresh_token|api_key|apikey|key|auth|secret|sig|signature|session|password)=)[^&#]*/gi,
+        "$1[REDACTED]"
+      );
+    }
+  };
+
+  const redactSecretsInText = (text) => {
+    if (typeof text !== "string") return "";
+    return text.replace(INLINE_SECRET_RE, "[REDACTED_SECRET]");
   };
 
   const formatIdSelector = (tag, id) => {
@@ -76,16 +191,16 @@ function collectPageReconInMainWorld() {
   };
 
   const getNearestContext = (el) => {
-    let cur = el?.parentElement;
+    let cur = getParentOrHost(el);
     let steps = 0;
     while (cur && cur !== document.body && steps < 6) {
       const w =
-        cur.getAttribute("data-widget") ||
-        cur.getAttribute("data-apiary-widget-name") ||
-        cur.getAttribute("data-zone-name") ||
-        cur.getAttribute("data-testid") ||
-        cur.getAttribute("data-auto") ||
-        cur.getAttribute("data-component");
+        cur.getAttribute?.("data-widget") ||
+        cur.getAttribute?.("data-apiary-widget-name") ||
+        cur.getAttribute?.("data-zone-name") ||
+        cur.getAttribute?.("data-testid") ||
+        cur.getAttribute?.("data-auto") ||
+        cur.getAttribute?.("data-component");
       if (w) return `${cur.tagName.toLowerCase()}[${w}]`;
       if (cur.id && !/^\d/.test(cur.id)) {
         return /^[A-Za-z_-][A-Za-z0-9_-]*$/.test(cur.id) ? `#${cur.id}` : `[id="${cur.id}"]`;
@@ -93,7 +208,10 @@ function collectPageReconInMainWorld() {
       if (["HEADER", "NAV", "MAIN", "FOOTER", "SECTION", "ARTICLE", "FORM"].includes(cur.tagName)) {
         return cur.tagName.toLowerCase();
       }
-      cur = cur.parentElement;
+      if (cur.shadowRoot) {
+        return `${cur.tagName.toLowerCase()}[shadow]`;
+      }
+      cur = getParentOrHost(cur);
       steps++;
     }
     return undefined;
@@ -185,9 +303,9 @@ function collectPageReconInMainWorld() {
     .filter((k) => !defaultGlobals.has(k) && !k.startsWith("webkit") && !/^\d+$/.test(k))
     .slice(0, 60);
 
-  // 3. Сбор семантических зон, виджетов (включая data-apiary-widget-name, data-zone-name, data-auto) и скелета DOM
-  const semanticLandmarks = Array.from(
-    document.querySelectorAll("main, nav, header, footer, article, section, [data-testid], [role='main'], [role='feed'], [role='region']")
+  // 3. Сбор семантических зон, виджетов (включая открытый Shadow DOM до 3 уровней) и скелета DOM
+  const semanticLandmarks = queryAllDeep(
+    "main, nav, header, footer, article, section, [data-testid], [role='main'], [role='feed'], [role='region']"
   )
     .filter((el) => !isExtensionNode(el))
     .slice(0, 45)
@@ -198,13 +316,14 @@ function collectPageReconInMainWorld() {
       role: el.getAttribute("role") || undefined,
       ariaLabel: el.getAttribute("aria-label") || undefined,
       childCount: el.children.length,
+      inShadowDom: isInsideShadowDom(el) || undefined,
     }));
 
   const seenWidgets = new Set();
   const widgetContainers = [];
   const widgetQuery =
     "[data-widget], [data-component], [data-block], [data-apiary-widget-name], [data-zone-name], [data-auto]";
-  for (const el of document.querySelectorAll(widgetQuery)) {
+  for (const el of queryAllDeep(widgetQuery)) {
     if (isExtensionNode(el)) continue;
     const name =
       el.getAttribute("data-widget") ||
@@ -220,17 +339,23 @@ function collectPageReconInMainWorld() {
       selector: getSelector(el),
       childCount: el.children.length,
       textPreview: (el.innerText || "").trim().replace(/\s+/g, " ").slice(0, 80) || undefined,
+      inShadowDom: isInsideShadowDom(el) || undefined,
     });
     if (widgetContainers.length >= 45) break;
   }
 
-  const buildSkeleton = (root, depth = 0, maxDepth = 5) => {
+  const buildSkeleton = (root, depth = 0, maxDepth = 5, shadowDepth = 0) => {
     if (!root || depth > maxDepth || isExtensionNode(root)) return null;
-    const children = Array.from(root.children || [])
-      .filter((el) => !["SCRIPT", "STYLE", "SVG", "NOSCRIPT", "LINK", "META"].includes(el.tagName) && !isExtensionNode(el))
-      .slice(0, 10);
+    const filterNodes = (list, limit) =>
+      Array.from(list || [])
+        .filter((el) => !["SCRIPT", "STYLE", "SVG", "NOSCRIPT", "LINK", "META"].includes(el.tagName) && !isExtensionNode(el))
+        .slice(0, limit);
 
-    return {
+    const children = filterNodes(root.children, 10)
+      .map((c) => buildSkeleton(c, depth + 1, maxDepth, shadowDepth))
+      .filter(Boolean);
+
+    const node = {
       selector: getSelector(root),
       attrs: {
         role: root.getAttribute?.("role") || undefined,
@@ -239,15 +364,26 @@ function collectPageReconInMainWorld() {
           .map((a) => `${a.name}="${a.value.slice(0, 60)}"`)
           .slice(0, 5),
       },
-      children: children.map((c) => buildSkeleton(c, depth + 1, maxDepth)).filter(Boolean),
+      children,
     };
+
+    if (root.shadowRoot && shadowDepth < MAX_SHADOW_DEPTH && depth < maxDepth) {
+      const shadowChildren = filterNodes(root.shadowRoot.children, 6)
+        .map((c) => buildSkeleton(c, depth + 1, maxDepth, shadowDepth + 1))
+        .filter(Boolean);
+      if (shadowChildren.length > 0) {
+        node.shadowChildren = shadowChildren;
+      }
+    }
+
+    return node;
   };
 
-  // 4. Сбор интерактивных элементов с дедупликацией
+  // 4. Сбор интерактивных элементов с дедупликацией (включая открытый Shadow DOM)
   const selectorPatternCounts = new Map();
   const interactiveElements = [];
 
-  for (const el of document.querySelectorAll("button, input, select, textarea, a[href], [role='button'], [data-testid]")) {
+  for (const el of queryAllDeep("button, input, select, textarea, a[href], [role='button'], [data-testid]")) {
     if (isExtensionNode(el)) continue;
     const tag = el.tagName.toLowerCase();
     if (!(["button", "input", "select", "textarea", "a"].includes(tag) || el.getAttribute("role") === "button")) {
@@ -255,7 +391,10 @@ function collectPageReconInMainWorld() {
     }
 
     const selector = getSelector(el);
-    const text = (el.innerText || el.value || "").trim().replace(/\s+/g, " ").slice(0, 60);
+    const rawText = isSensitiveInput(el)
+      ? (el.value ? "[REDACTED_INPUT]" : "")
+      : (el.innerText || el.value || "");
+    const text = rawText.trim().replace(/\s+/g, " ").slice(0, 60);
     const patternKey = `${selector}::${text ? "hasText" : "empty"}`;
     const count = selectorPatternCounts.get(patternKey) || 0;
 
@@ -273,17 +412,18 @@ function collectPageReconInMainWorld() {
       placeholder: el.getAttribute("placeholder") || undefined,
       text,
       href: el.getAttribute("href") ? el.getAttribute("href").slice(0, 120) : undefined,
+      inShadowDom: isInsideShadowDom(el) || undefined,
     });
 
     if (interactiveElements.length >= 65) break;
   }
 
-  // 5. Сбор медиа-элементов
+  // 5. Сбор медиа-элементов (включая открытый Shadow DOM)
   const seenImgSrc = new Set();
   const contentImages = [];
   const smallIconsOrAvatars = [];
 
-  for (const el of document.querySelectorAll("img, canvas, picture source")) {
+  for (const el of queryAllDeep("img, canvas, picture source")) {
     const src = el.currentSrc || el.src || el.getAttribute("data-src") || el.getAttribute("srcset") || null;
     if (!src || seenImgSrc.has(src)) continue;
     if (src.includes("/emoji/") || src.startsWith("data:image/svg")) continue;
@@ -293,11 +433,12 @@ function collectPageReconInMainWorld() {
     const h = el.naturalHeight || el.height || el.clientHeight || 0;
     const item = {
       selector: getSelector(el),
-      parentSelector: getSelector(el.parentElement),
+      parentSelector: getSelector(getParentOrHost(el)),
       src,
       width: w,
       height: h,
       alt: el.getAttribute("alt") ? el.getAttribute("alt").slice(0, 40) : undefined,
+      inShadowDom: isInsideShadowDom(el) || undefined,
     };
 
     if (w >= 100 || h >= 100) {
@@ -307,13 +448,14 @@ function collectPageReconInMainWorld() {
     }
   }
 
-  const videosAndStreams = Array.from(document.querySelectorAll("video, audio, video source, iframe"))
+  const videosAndStreams = queryAllDeep("video, audio, video source, iframe")
     .slice(0, 25)
     .map((el) => ({
       selector: getSelector(el),
-      parentSelector: getSelector(el.parentElement),
+      parentSelector: getSelector(getParentOrHost(el)),
       src: el.currentSrc || el.src || el.getAttribute("data-src") || null,
       poster: el.getAttribute("poster") || undefined,
+      inShadowDom: isInsideShadowDom(el) || undefined,
     }));
 
   // 6. Сетевая активность из Performance API с фильтрацией шума
@@ -338,7 +480,7 @@ function collectPageReconInMainWorld() {
     .slice(-60)
     .map((r) => ({
       initiatorType: r.initiatorType,
-      url: r.name,
+      url: sanitizeUrl(r.name),
       durationMs: Math.round(r.duration),
       transferSize: r.transferSize || 0,
     }));
@@ -376,12 +518,12 @@ function collectPageReconInMainWorld() {
     .map((s) => ({
       id: s.id || null,
       type: s.type || null,
-      preview: (s.textContent || "").trim().slice(0, 800),
+      preview: redactSecretsInText((s.textContent || "").trim()).slice(0, 800),
     }));
 
   return {
     meta: {
-      url: location.href,
+      url: sanitizeUrl(location.href),
       origin: location.origin,
       pathname: location.pathname,
       title: document.title,
@@ -395,10 +537,11 @@ function collectPageReconInMainWorld() {
       inlineJsonScripts,
     },
     domStructure: {
+      shadowRootsFound: Math.max(0, allDomRoots.length - 1),
       semanticLandmarks,
       widgetContainers,
       interactiveElements,
-      skeleton: buildSkeleton(document.body, 0, 5),
+      skeleton: buildSkeleton(document.body, 0, 5, 0),
     },
     mediaAndAssets: {
       contentImages,
@@ -421,6 +564,260 @@ function collectPageReconInMainWorld() {
   };
 }
 
+function isSystemTabUrl(url) {
+  return !url || /^(chrome|edge|about|chrome-extension):/i.test(url);
+}
+
+function getUtf8ByteLength(str) {
+  if (typeof TextEncoder !== "undefined") {
+    return new TextEncoder().encode(str).length;
+  }
+  return str.length * 2;
+}
+
+function truncateStringField(val, maxLen) {
+  if (typeof val !== "string" || val.length <= maxLen) return val;
+  return val.slice(0, maxLen) + "... [trimmed]";
+}
+
+function pruneSkeletonTree(node, maxDepth, maxChildren, depth = 0) {
+  if (!node || depth > maxDepth) return null;
+  const pruned = {
+    selector: node.selector,
+    attrs: node.attrs,
+    children: [],
+  };
+  if (depth < maxDepth && Array.isArray(node.children)) {
+    pruned.children = node.children
+      .slice(0, maxChildren)
+      .map((child) => pruneSkeletonTree(child, maxDepth, maxChildren, depth + 1))
+      .filter(Boolean);
+  }
+  if (depth < maxDepth && Array.isArray(node.shadowChildren) && node.shadowChildren.length > 0) {
+    pruned.shadowChildren = node.shadowChildren
+      .slice(0, Math.min(4, maxChildren))
+      .map((child) => pruneSkeletonTree(child, maxDepth, maxChildren, depth + 1))
+      .filter(Boolean);
+  }
+  return pruned;
+}
+
+function trimStorageObject(obj, maxKeys, maxValLen) {
+  if (!obj || typeof obj !== "object") return obj;
+  const out = {};
+  for (const key of Object.keys(obj).slice(0, maxKeys)) {
+    out[key] = truncateStringField(obj[key], maxValLen);
+  }
+  return out;
+}
+
+function enforceReportSizeBudget(report, maxBytes = MAX_REPORT_BYTES) {
+  const measure = (r) => getUtf8ByteLength(formatAsAiMarkdown(r));
+  const originalBytes = measure(report);
+  if (originalBytes <= maxBytes) {
+    return report;
+  }
+
+  const appliedStages = [];
+  const targetBytes = Math.max(4096, maxBytes - 512);
+
+  // Этап 1: укорачиваем длинные превью тел запросов/ответов и встроенных JSON-скриптов
+  if (measure(report) > targetBytes) {
+    for (const req of report.network?.interceptedRequests || []) {
+      if (req.responsePreview) req.responsePreview = truncateStringField(req.responsePreview, 300);
+      if (req.requestBody) req.requestBody = truncateStringField(req.requestBody, 300);
+    }
+    for (const ep of report.sessionFlow?.uniqueEndpoints || []) {
+      if (ep.responsePreview) ep.responsePreview = truncateStringField(ep.responsePreview, 300);
+      if (ep.requestBodyPreview) ep.requestBodyPreview = truncateStringField(ep.requestBodyPreview, 300);
+    }
+    for (const s of report.techStack?.inlineJsonScripts || []) {
+      if (s.preview) s.preview = truncateStringField(s.preview, 300);
+    }
+    appliedStages.push("shortened_previews");
+  }
+
+  // Этап 2: уменьшаем глубину DOM-скелета и второстепенные списки
+  if (measure(report) > targetBytes) {
+    if (report.domStructure?.skeleton) {
+      report.domStructure.skeleton = pruneSkeletonTree(report.domStructure.skeleton, 3, 6);
+    }
+    if (report.mediaAndAssets?.smallIconsOrAvatars) {
+      report.mediaAndAssets.smallIconsOrAvatars = report.mediaAndAssets.smallIconsOrAvatars.slice(0, 5);
+    }
+    if (report.network?.performanceResourceEntries) {
+      report.network.performanceResourceEntries = report.network.performanceResourceEntries.slice(-25);
+    }
+    if (report.storage?.allCookieMeta) {
+      report.storage.allCookieMeta = report.storage.allCookieMeta.slice(0, 20);
+    }
+    appliedStages.push("pruned_skeleton_and_secondary_lists");
+  }
+
+  // Этап 3: сжимаем сетевые превью и ограничиваем объёмные массивы
+  if (measure(report) > targetBytes) {
+    if (Array.isArray(report.network?.interceptedRequests)) {
+      report.network.interceptedRequests = report.network.interceptedRequests.slice(-25).map((req) => ({
+        ...req,
+        requestBody: req.requestBody ? "[Trimmed for size budget]" : req.requestBody,
+        responsePreview: req.responsePreview ? "[Trimmed for size budget]" : req.responsePreview,
+      }));
+    }
+    if (Array.isArray(report.sessionFlow?.uniqueEndpoints)) {
+      report.sessionFlow.uniqueEndpoints = report.sessionFlow.uniqueEndpoints.slice(0, 40).map((ep) => ({
+        ...ep,
+        requestBodyPreview: ep.requestBodyPreview ? "[Trimmed for size budget]" : ep.requestBodyPreview,
+        responsePreview: ep.responsePreview ? "[Trimmed for size budget]" : ep.responsePreview,
+      }));
+    }
+    if (report.domStructure?.interactiveElements) {
+      report.domStructure.interactiveElements = report.domStructure.interactiveElements.slice(0, 35);
+    }
+    if (report.domStructure?.semanticLandmarks) {
+      report.domStructure.semanticLandmarks = report.domStructure.semanticLandmarks.slice(0, 25);
+    }
+    if (report.domStructure?.widgetContainers) {
+      report.domStructure.widgetContainers = report.domStructure.widgetContainers.slice(0, 25);
+    }
+    if (report.mediaAndAssets?.contentImages) {
+      report.mediaAndAssets.contentImages = report.mediaAndAssets.contentImages.slice(0, 15);
+    }
+    appliedStages.push("compacted_network_and_dom_lists");
+  }
+
+  // Этап 4: жёсткое усечение, если отчёт всё ещё превышает бюджет
+  if (measure(report) > targetBytes) {
+    if (report.domStructure) {
+      report.domStructure.skeleton = null;
+    }
+    if (report.techStack?.inlineJsonScripts) {
+      report.techStack.inlineJsonScripts = report.techStack.inlineJsonScripts.slice(0, 3).map((s) => ({
+        ...s,
+        preview: truncateStringField(s.preview, 120),
+      }));
+    }
+    if (report.storage) {
+      report.storage.localStorage = trimStorageObject(report.storage.localStorage, 15, 100);
+      report.storage.sessionStorage = trimStorageObject(report.storage.sessionStorage, 15, 100);
+    }
+    if (Array.isArray(report.network?.interceptedRequests)) {
+      report.network.interceptedRequests = report.network.interceptedRequests.slice(-15).map((req) => ({
+        ...req,
+        requestHeaders: {},
+      }));
+    }
+    if (report.sessionFlow) {
+      if (Array.isArray(report.sessionFlow.uniqueEndpoints)) {
+        report.sessionFlow.uniqueEndpoints = report.sessionFlow.uniqueEndpoints.slice(0, 25).map((ep) => ({
+          ...ep,
+          requestHeaders: {},
+        }));
+      }
+      if (Array.isArray(report.sessionFlow.userActions)) {
+        report.sessionFlow.userActions = report.sessionFlow.userActions.slice(0, 30);
+      }
+      if (Array.isArray(report.sessionFlow.pagesVisited)) {
+        report.sessionFlow.pagesVisited = report.sessionFlow.pagesVisited.slice(0, 15);
+      }
+    }
+    appliedStages.push("hard_budget_cap");
+  }
+
+  // Аварийное пошаговое сжатие для экстремально больших записей
+  const shrinkableArrays = [
+    () => report.network?.interceptedRequests,
+    () => report.network?.performanceResourceEntries,
+    () => report.sessionFlow?.uniqueEndpoints,
+    () => report.sessionFlow?.userActions,
+    () => report.domStructure?.interactiveElements,
+    () => report.domStructure?.widgetContainers,
+    () => report.mediaAndAssets?.contentImages,
+    () => report.techStack?.inlineJsonScripts,
+  ];
+  let guard = 0;
+  while (measure(report) > targetBytes && guard < 12) {
+    guard++;
+    let changed = false;
+    for (const getter of shrinkableArrays) {
+      const arr = getter();
+      if (Array.isArray(arr) && arr.length > 5) {
+        arr.length = Math.max(5, Math.floor(arr.length / 2));
+        changed = true;
+      }
+    }
+    if (!changed) break;
+    if (!appliedStages.includes("emergency_array_shrink")) {
+      appliedStages.push("emergency_array_shrink");
+    }
+  }
+
+  report.meta = report.meta || {};
+  report.meta.sizeBudget = {
+    maxBytes,
+    originalBytes,
+    trimmed: true,
+    appliedStages,
+  };
+  report.meta.sizeBudget.finalBytes = measure(report);
+
+  return report;
+}
+
+function buildSessionOnlyReport(sessionFlow, activeTabUrl = "") {
+  const fallbackUrl = sessionFlow?.startUrl || sessionFlow?.origin || activeTabUrl || "";
+  let origin = sessionFlow?.origin || "";
+  let pathname = "";
+  try {
+    if (fallbackUrl) {
+      const u = new URL(fallbackUrl);
+      origin = origin || u.origin;
+      pathname = u.pathname;
+    }
+  } catch (_) {}
+
+  const lastPage = sessionFlow?.pagesVisited?.[sessionFlow.pagesVisited.length - 1];
+  return {
+    meta: {
+      extensionVersion: EXTENSION_VERSION,
+      url: fallbackUrl,
+      origin,
+      pathname,
+      title: lastPage?.title || sessionFlow?.origin || "Recorded Session Flow",
+      timestamp: new Date().toISOString(),
+      note: "Запись остановлена на системной вкладке браузера — отчет сформирован на основе записанного sessionFlow без DOM-слепка текущей вкладки.",
+    },
+    techStack: {
+      detectedFrameworks: [],
+      customWindowGlobals: [],
+      inlineJsonScripts: [],
+    },
+    domStructure: {
+      shadowRootsFound: 0,
+      semanticLandmarks: [],
+      widgetContainers: [],
+      interactiveElements: [],
+      skeleton: null,
+    },
+    mediaAndAssets: {
+      contentImages: [],
+      smallIconsOrAvatars: [],
+      videosAndStreams: [],
+    },
+    network: {
+      filteredNoiseCount: 0,
+      interceptedRequests: [],
+      webSockets: sessionFlow?.webSockets || [],
+      performanceResourceEntries: [],
+    },
+    storage: {
+      localStorage: {},
+      sessionStorage: {},
+      cookieNames: [],
+    },
+    sessionFlow: sessionFlow || null,
+  };
+}
+
 function formatAsAiMarkdown(report) {
   const modeNote = report.sessionFlow
     ? " В отчет также включена запись пользовательского флоу (`sessionFlow`: посещенные страницы, клики/сабмиты, уникальные дедуплицированные API-эндпоинты и все встреченные виджеты)."
@@ -434,7 +831,7 @@ function formatAsAiMarkdown(report) {
     `- **Custom Window Globals**: \`${report.techStack.customWindowGlobals.slice(0, 30).join("`, `")}\``,
     "",
     "## Контекст для ИИ",
-    `Ниже находится полный технический слепок веб-страницы (семантические узлы с \`data-testid\`/\`data-widget\` и \`aria-label\`, дерево виджетов, крупные медиа-контейнеры, очищенные от трекеров перехваченные запросы Fetch/XHR/GraphQL, соединения WebSocket с примерами фреймов, а также ключи localStorage/cookies с замаскированными секретами).${modeNote} Используй эти реальные селекторы и эндпоинты для написания расширения, парсера или пользовательского скрипта без выдумывания несуществующих классов.`,
+    `Ниже находится полный технический слепок веб-страницы (семантические узлы с \`data-testid\`/\`data-widget\` и \`aria-label\`, дерево виджетов и открытого Shadow DOM, крупные медиа-контейнеры, очищенные от трекеров перехваченные запросы Fetch/XHR/GraphQL, соединения WebSocket с примерами фреймов, а также ключи localStorage/cookies с замаскированными секретами).${modeNote} Используй эти реальные селекторы и эндпоинты для написания расширения, парсера или пользовательского скрипта без выдумывания несуществующих классов.`,
     "",
     "```json",
     JSON.stringify(report, null, 2),
@@ -456,7 +853,7 @@ async function runFullPageScan(sessionFlow = null) {
   if (!tab || !tab.id) {
     throw new Error("Не удалось получить активную вкладку.");
   }
-  if (!tab.url || /^(chrome|edge|about|chrome-extension):/i.test(tab.url)) {
+  if (isSystemTabUrl(tab.url)) {
     throw new Error("Системные страницы браузера недоступны для сканирования.");
   }
 
@@ -470,6 +867,9 @@ async function runFullPageScan(sessionFlow = null) {
   if (!report) {
     throw new Error("Не удалось собрать данные со страницы.");
   }
+
+  report.meta = report.meta || {};
+  report.meta.extensionVersion = EXTENSION_VERSION;
 
   try {
     const allCookies = await chrome.cookies.getAll({ url: tab.url });
@@ -485,6 +885,7 @@ async function runFullPageScan(sessionFlow = null) {
     report.sessionFlow = sessionFlow;
   }
 
+  enforceReportSizeBudget(report);
   latestReport = report;
   latestMarkdown = formatAsAiMarkdown(report);
   const copied = await copyTextSafely(latestMarkdown);
@@ -540,11 +941,13 @@ scanBtn.addEventListener("click", async () => {
         frameworks: report.techStack.detectedFrameworks,
         landmarksFound: report.domStructure.semanticLandmarks.length,
         widgetsFound: widgetCount,
+        shadowRootsFound: report.domStructure.shadowRootsFound || 0,
         interceptedHttp: report.network.interceptedRequests.length,
         filteredNoise: report.network.filteredNoiseCount,
         webSockets: wsCount,
         perfEntries: report.network.performanceResourceEntries.length,
         contentImages: imgCount,
+        ...(report.meta.sizeBudget?.trimmed ? { sizeBudgetTrimmedKB: Math.round(report.meta.sizeBudget.finalBytes / 1024) } : {}),
       },
       null,
       2
@@ -560,11 +963,12 @@ recordBtn.addEventListener("click", async () => {
   recordBtn.disabled = true;
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab || !tab.id || !tab.url || /^(chrome|edge|about|chrome-extension):/i.test(tab.url)) {
-      throw new Error("Открой обычный сайт перед началом записи.");
-    }
 
     if (!isRecordingActive) {
+      if (!tab || !tab.id || isSystemTabUrl(tab.url)) {
+        throw new Error("Открой обычный сайт перед началом записи.");
+      }
+
       const status = await chrome.runtime.sendMessage({
         type: "RECON_START_RECORDING",
         tabId: tab.id,
@@ -576,7 +980,26 @@ recordBtn.addEventListener("click", async () => {
       const stopRes = await chrome.runtime.sendMessage({ type: "RECON_STOP_RECORDING" });
       updateRecordButtonUI({ active: false });
 
-      const { report, copied } = await runFullPageScan(stopRes?.session || null);
+      const sessionFlow = stopRes?.session || null;
+      let report;
+      let copied;
+
+      if (!tab || !tab.id || isSystemTabUrl(tab.url)) {
+        if (!sessionFlow) {
+          throw new Error("Запись остановлена, но данных сессии не найдено.");
+        }
+        report = buildSessionOnlyReport(sessionFlow, tab?.url || "");
+        enforceReportSizeBudget(report);
+        latestReport = report;
+        latestMarkdown = formatAsAiMarkdown(report);
+        copied = await copyTextSafely(latestMarkdown);
+        copyAiBtn.disabled = false;
+        copyJsonBtn.disabled = false;
+        downloadBtn.disabled = false;
+      } else {
+        ({ report, copied } = await runFullPageScan(sessionFlow));
+      }
+
       const pages = report.sessionFlow?.pagesVisited?.length || 0;
       const eps = report.sessionFlow?.uniqueEndpoints?.length || 0;
       const acts = report.sessionFlow?.userActions?.length || 0;
@@ -594,6 +1017,7 @@ recordBtn.addEventListener("click", async () => {
           uniqueEndpoints: eps,
           userActions: acts,
           allWidgetsSeen: report.sessionFlow?.allWidgetsSeen?.length || 0,
+          ...(report.meta.sizeBudget?.trimmed ? { sizeBudgetTrimmedKB: Math.round(report.meta.sizeBudget.finalBytes / 1024) } : {}),
         },
         null,
         2
@@ -626,11 +1050,17 @@ downloadBtn.addEventListener("click", () => {
   if (!latestMarkdown) return;
   const blob = new Blob([latestMarkdown], { type: "text/markdown;charset=utf-8" });
   const url = URL.createObjectURL(blob);
-  const host = new URL(latestReport.meta.url).hostname.replace(/[^a-z0-9.-]/gi, "_");
+  let host = "site";
+  try {
+    const parsedHost = new URL(latestReport?.meta?.url || "").hostname;
+    if (parsedHost) {
+      host = parsedHost.replace(/[^a-z0-9.-]/gi, "_");
+    }
+  } catch (_) {}
   const a = document.createElement("a");
   a.href = url;
   a.download = `site-recon-${host}-${Date.now()}.md`;
   a.click();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
   statusEl.textContent = "💾 Файл отчета сохранен!";
 });
